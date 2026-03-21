@@ -1,0 +1,92 @@
+# =========================
+# Node / TypeScript
+# =========================
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# OS / Editor junk
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# Cache / temp data
+# =========================
+data/cache/
+data/tmp/
+.cache/
+tmp/
+temp/
+
+# =========================
+# Generated content (VERY IMPORTANT)
+# =========================
+output/
+data/outputs/
+renders/
+videos/
+audio/
+tts/
+subtitles/
+
+# =========================
+# Media files (generated)
+# =========================
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+*.mp3
+*.aac
+*.srt
+*.ass
+
+# =========================
+# Background assets (optional)
+# =========================
+# If you download big background videos locally
+data/backgrounds/
+
+# =========================
+# API dumps / raw data
+# =========================
+*.jsonl
+*.ndjson
+
+# =========================
+# Testing / coverage
+# =========================
+coverage/
+.nyc_output/
+
+# =========================
+# Misc
+# =========================
+*.pid
+*.seed
+*.lock
+
+# Keep lockfiles (important for reproducibility)
+!package-lock.json
+!pnpm-lock.yaml
+!yarn.lock
