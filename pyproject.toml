@@ -1,0 +1,11 @@
+[project]
+name = "content-machine-2"
+version = "0.1.0"
+description = "Skeleton short-form content making pipeline"
+requires-python = ">=3.11"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
