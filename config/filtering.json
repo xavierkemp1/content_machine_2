@@ -1,0 +1,11 @@
+{
+  "blacklist_phrases": ["graphic violence", "self-harm"],
+  "length_buckets": {
+    "short_max_words": 80,
+    "medium_max_words": 200
+  },
+  "dedupe": {
+    "enabled": true,
+    "similarity_threshold": 0.9
+  }
+}

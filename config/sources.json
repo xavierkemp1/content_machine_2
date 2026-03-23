@@ -1,0 +1,16 @@
+{
+  "reddit": {
+    "enabled": true,
+    "subreddits": ["AmItheAsshole", "confession", "Entrepreneur"],
+    "min_score": 100,
+    "min_comments": 20,
+    "lookback_hours": 48
+  },
+  "x": {
+    "enabled": true,
+    "accounts": ["@example1", "@example2"],
+    "min_likes": 300,
+    "min_replies": 20,
+    "lookback_hours": 48
+  }
+}
