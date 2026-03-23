@@ -1,30 +1,96 @@
 # content_machine_2
-The purpose of this project is to automate the process of creating viral content, through the use of various apis. The project will follow the below flow:
 
-1) Obtaining raw 'potential content'
-   Top performing text content will be scraped from reddit and x using their apis (vauge on how to obtian/ determine the best potential posts, gpt help expand this). The X accounts and subreddits will be able to be set in a control pannel file. Keys and secrets will be held in a local .env file. Output of this stage will be a set of normalised text post objects.
+The purpose of this project is to automate the process of creating viral content, through the use of various APIs. The project will follow the below flow:
 
-2) Filtering
-   posts will then be filtered for blacklist words, remove duplicates, and sorted into short, medium and long groups, based on the number of words in a post. after this, remaining posts will be sent to openai api and ranked in order of potential virality, based on the following criteria:
-  hook strength
-  emotional charge
-  clarity
-  relatability
-  comment bait
-  short-form suitability
-Output from this stage would be the top x short, medium and long sets of filtered text post objects.
+1) Obtaining raw 'potential content'  
+Top performing text content will be fetched from Reddit and X using their APIs.  
 
-3) Improvements
-   Successful posts would then be sent back to openai api to edit successful posts to maximise potential virality, returning:
-  better hook
-  rewritten, sligtly improved text for narration
-  title
-  caption
-  hashtags
-  output for this section will be a list of potentially viral posts, ready for tts
+Post selection will be based on:
+- engagement (upvotes / likes / comments)
+- recency (e.g. last 24–72 hours)
+- subreddit or account relevance (defined in config)
+- minimum thresholds (e.g. score > X, comments > Y)
 
-4) Production
-   realistic tts for the content will be implimented. captions and background video will be added in 9:16 format, so the content can be viewed as a viral reel/ tiktok.
-  (more detail)
+The X accounts and subreddits will be configurable in a control panel config file (e.g. `config/sources.json`).  
 
-5) Posts will then be saved as mp4 files in folders based on their content, ready for the user to post on chosen short form content platforms.
+Keys and secrets will be stored in a local `.env` file.  
+
+Output of this stage will be a set of normalised text post objects.
+
+---
+
+2) Filtering  
+
+Posts will be filtered using rule-based logic:
+- blacklist words/phrases
+- duplicate removal (based on similarity or identical titles)
+- minimum/maximum length constraints
+- removal of posts that rely on images/videos for context
+
+Posts will then be grouped into:
+- short (e.g. < 80 words)
+- medium (80–200 words)
+- long (200+ words)
+
+After filtering, remaining posts will be sent to the OpenAI API and ranked in order of potential virality, based on the following criteria:
+- hook strength  
+- emotional charge  
+- clarity  
+- relatability  
+- comment bait  
+- short-form suitability  
+
+Output from this stage will be the top X posts from each group (short, medium, long), ranked by viral potential.
+
+---
+
+3) Improvements  
+
+Selected posts will be sent to the OpenAI API to improve their suitability for short-form content.
+
+The model should:
+- preserve the original meaning and core story
+- improve hook strength (first 1–2 lines)
+- simplify and tighten wording for narration
+- improve pacing for a ~20–45 second delivery
+
+It will return:
+- improved hook  
+- rewritten narration text  
+- title  
+- caption  
+- hashtags  
+
+Output for this section will be a list of enhanced content objects, ready for TTS.
+
+---
+
+4) Production  
+
+Each enhanced content object will be converted into a short-form video:
+
+- Generate TTS audio from narration text  
+- Generate subtitle file (SRT or similar)  
+- Select background video (e.g. gameplay loop, stock footage, abstract visuals)  
+- Combine audio + subtitles + background into a 9:16 vertical video  
+
+Video rendering will be handled programmatically (e.g. using ffmpeg).
+
+---
+
+5) Export  
+
+Posts will be saved as `.mp4` files in folders based on their content type (theme/niche), for example:
+
+- `/output/aita`
+- `/output/confessions`
+- `/output/business`
+- `/output/dating`
+
+Each video may also include a metadata JSON file containing:
+- script
+- caption
+- hashtags
+- source reference
+
+These outputs are intended for manual posting to short-form platforms (TikTok, Instagram Reels, YouTube Shorts).
