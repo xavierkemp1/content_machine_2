@@ -15,10 +15,10 @@
 - [x] Implement rule-based filtering (blacklist, length, media-dependent filtering).
 - [x] Implement duplicate detection and similarity-based removal.
 - [x] Implement OpenAI ranking for virality scoring.
-- [ ] Implement OpenAI rewrite/enhancement for hooks, narration, title, caption, hashtags.
-- [ ] Implement TTS generation.
-- [ ] Implement subtitle generation.
-- [ ] Implement background video selection logic.
-- [ ] Implement ffmpeg composition for 9:16 video export.
-- [ ] Implement metadata JSON export per video.
-- [ ] Add tests for each pipeline stage.
+- [x] Implement OpenAI rewrite/enhancement for hooks, narration, title, caption, hashtags.
+- [x] Implement TTS generation.
+- [x] Implement subtitle generation.
+- [x] Implement background video selection logic.
+- [x] Implement ffmpeg composition for 9:16 video export.
+- [x] Implement metadata JSON export per video.
+- [x] Add tests for each pipeline stage.
