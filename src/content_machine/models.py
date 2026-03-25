@@ -45,3 +45,5 @@ class ProductionArtifact:
     video_path: str
     subtitles_path: str
     metadata_path: str
+    audio_path: str = ""
+    background_path: str = ""
