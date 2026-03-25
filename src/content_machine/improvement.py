@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Any
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
+from .http_utils import request_json_with_retries
 from .models import EnhancedContent, RankedPost
+
+logger = logging.getLogger(__name__)
 
 
 def _clean_lines(text: str) -> list[str]:
@@ -47,6 +51,8 @@ def _fallback_enhancement(post: RankedPost) -> EnhancedContent:
 def _openai_enhance(posts: list[RankedPost]) -> dict[str, dict[str, Any]]:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key or not posts:
+        if posts and not api_key:
+            logger.warning("Skipping OpenAI enhancement because OPENAI_API_KEY is not set.")
         return {}
 
     model = os.getenv("OPENAI_REWRITE_MODEL", "gpt-4.1-mini")
@@ -90,11 +96,18 @@ def _openai_enhance(posts: list[RankedPost]) -> dict[str, dict[str, Any]]:
         },
         method="POST",
     )
+    body = request_json_with_retries(
+        request,
+        operation="OpenAI enhancement request",
+        timeout=60,
+        max_attempts=4,
+    )
+    if not body:
+        return {}
     try:
-        with urlopen(request, timeout=60) as response:
-            body = json.loads(response.read().decode("utf-8"))
         parsed = json.loads(body.get("output_text", "{}"))
-    except Exception:
+    except json.JSONDecodeError:
+        logger.error("OpenAI enhancement output_text was not valid JSON; using fallback enhancement.")
         return {}
 
     enhanced: dict[str, dict[str, Any]] = {}

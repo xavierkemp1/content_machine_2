@@ -4,13 +4,17 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 import json
+import logging
 import math
 import os
 from typing import Any
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .config import load_json
+from .http_utils import request_json_with_retries
 from .models import RawPost, RankedPost
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_text(text: str) -> str:
@@ -160,6 +164,8 @@ def _heuristic_viral_score(post: RawPost) -> tuple[float, dict[str, float]]:
 def _openai_rank(posts: list[RawPost]) -> dict[str, dict[str, Any]]:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key or not posts:
+        if posts and not api_key:
+            logger.warning("Skipping OpenAI ranking because OPENAI_API_KEY is not set.")
         return {}
 
     model = os.getenv("OPENAI_RANKING_MODEL", "gpt-4.1-mini")
@@ -201,19 +207,24 @@ def _openai_rank(posts: list[RawPost]) -> dict[str, dict[str, Any]]:
         method="POST",
     )
 
-    try:
-        with urlopen(request, timeout=45) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except Exception:
+    body = request_json_with_retries(
+        request,
+        operation="OpenAI virality ranking request",
+        timeout=45,
+        max_attempts=4,
+    )
+    if not body:
         return {}
 
     output_text = body.get("output_text", "")
     if not output_text:
+        logger.error("OpenAI ranking response did not include output_text; falling back to heuristic scores.")
         return {}
 
     try:
         parsed = json.loads(output_text)
     except json.JSONDecodeError:
+        logger.error("OpenAI ranking output_text was not valid JSON; falling back to heuristic scores.")
         return {}
 
     scores = {}

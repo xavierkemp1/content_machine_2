@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import json
+import logging
 import os
 from typing import Any
 from urllib.parse import quote_plus
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .config import load_json
+from .http_utils import request_json_with_retries
 from .models import RawPost
+
+logger = logging.getLogger(__name__)
 
 
 _REDDIT_URL = "https://www.reddit.com/r/{subreddit}/top.json?t=day&limit=50"
@@ -37,8 +40,7 @@ def _is_within_lookback(created_at: datetime, lookback_hours: int) -> bool:
 
 def _request_json(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
     request = Request(url=url, headers=headers or {})
-    with urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return request_json_with_retries(request, operation=f"GET {url}", timeout=20, max_attempts=3)
 
 
 def fetch_reddit_posts() -> list[RawPost]:
@@ -119,6 +121,7 @@ def fetch_x_posts() -> list[RawPost]:
 
     bearer_token = os.getenv("X_BEARER_TOKEN", "").strip()
     if not bearer_token:
+        logger.warning("Skipping X sourcing because X_BEARER_TOKEN is not set.")
         return []
 
     min_likes = int(cfg.get("min_likes", 0))
@@ -152,6 +155,7 @@ def fetch_x_posts() -> list[RawPost]:
                 payload = None
 
         if not payload:
+            logger.error("Unable to fetch X posts for @%s after trying all configured API endpoints.", handle)
             continue
 
         users = {
