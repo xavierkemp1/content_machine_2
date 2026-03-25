@@ -10,11 +10,11 @@
 
 ## Tasks To Do
 
-- [ ] Implement Reddit API ingestion and normalization.
-- [ ] Implement X API ingestion and normalization.
-- [ ] Implement rule-based filtering (blacklist, length, media-dependent filtering).
-- [ ] Implement duplicate detection and similarity-based removal.
-- [ ] Implement OpenAI ranking for virality scoring.
+- [x] Implement Reddit API ingestion and normalization.
+- [x] Implement X API ingestion and normalization.
+- [x] Implement rule-based filtering (blacklist, length, media-dependent filtering).
+- [x] Implement duplicate detection and similarity-based removal.
+- [x] Implement OpenAI ranking for virality scoring.
 - [ ] Implement OpenAI rewrite/enhancement for hooks, narration, title, caption, hashtags.
 - [ ] Implement TTS generation.
 - [ ] Implement subtitle generation.
