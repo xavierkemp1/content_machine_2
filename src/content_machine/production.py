@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import wave
 
 from .models import EnhancedContent, ProductionArtifact
+
+logger = logging.getLogger(__name__)
 
 
 def _slugify(value: str) -> str:
@@ -32,6 +36,83 @@ def _generate_tts_stub(narration: str, output_path: Path) -> str:
         wav_file.setsampwidth(2)
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(b"\x00\x00" * total_frames)
+    return str(output_path)
+
+
+_DEFAULT_PIPER_VOICE = "en_GB-northern_english_male-medium"
+
+
+def _generate_tts(narration: str, output_path: Path) -> str:
+    """Generate TTS audio via Piper when configured, otherwise fall back to the silent stub.
+
+    Environment variables
+    ---------------------
+    PIPER_EXE        Path to the piper executable.  When unset or the file is
+                     absent the silent stub is used instead (offline-safe).
+    PIPER_VOICES_DIR Directory that contains the ``.onnx`` voice model files.
+    PIPER_VOICE      Voice basename without extension
+                     (default: ``en_GB-northern_english_male-medium``).
+    """
+    piper_exe = os.getenv("PIPER_EXE", "").strip()
+    if not piper_exe or not Path(piper_exe).is_file():
+        if piper_exe:
+            logger.warning(
+                "PIPER_EXE is set to %r but the file was not found; "
+                "falling back to silent TTS stub.",
+                piper_exe,
+            )
+        return _generate_tts_stub(narration, output_path)
+
+    voices_dir = os.getenv("PIPER_VOICES_DIR", "").strip()
+    voice = os.getenv("PIPER_VOICE", _DEFAULT_PIPER_VOICE).strip() or _DEFAULT_PIPER_VOICE
+    model_path = Path(voices_dir) / f"{voice}.onnx" if voices_dir else Path(f"{voice}.onnx")
+
+    if not model_path.is_file():
+        logger.warning(
+            "Piper voice model not found at %r; falling back to silent TTS stub.",
+            str(model_path),
+        )
+        return _generate_tts_stub(narration, output_path)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        piper_exe,
+        "--model",
+        str(model_path),
+        "--output_file",
+        str(output_path),
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            input=narration,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Piper exited with code %d: %s; falling back to silent TTS stub.",
+                result.returncode,
+                result.stderr[-500:],
+            )
+            return _generate_tts_stub(narration, output_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Piper TTS failed (%s); falling back to silent TTS stub.",
+            exc,
+        )
+        return _generate_tts_stub(narration, output_path)
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        logger.warning(
+            "Piper produced no output at %r; falling back to silent TTS stub.",
+            str(output_path),
+        )
+        return _generate_tts_stub(narration, output_path)
+
+    logger.info("Piper TTS generated %r using voice %r.", str(output_path), voice)
     return str(output_path)
 
 
@@ -143,7 +224,7 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
 
     root = Path(work_dir)
     stem = f"{content.source_post.raw.source}-{_slugify(content.source_post.raw.source_id)}"
-    audio_path = _generate_tts_stub(content.narration, root / "audio" / f"{stem}.wav")
+    audio_path = _generate_tts(content.narration, root / "audio" / f"{stem}.wav")
     subtitles_path = _generate_subtitles(content.narration, root / "subs" / f"{stem}.srt")
     video_path = _compose_video(
         audio_path=audio_path,

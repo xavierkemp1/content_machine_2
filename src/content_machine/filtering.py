@@ -218,6 +218,18 @@ def _openai_rank(posts: list[RawPost]) -> dict[str, dict[str, Any]]:
 
     output_text = body.get("output_text", "")
     if not output_text:
+        # Modern Responses API: text is inside body["output"] as message content parts.
+        output_parts: list[str] = []
+        for item in body.get("output", []):
+            for part in item.get("content", []):
+                part_type = part.get("type", "")
+                if part_type in ("output_text", "text"):
+                    text_value = part.get("text", "")
+                    if text_value:
+                        output_parts.append(text_value)
+        output_text = "".join(output_parts)
+
+    if not output_text:
         logger.error("OpenAI ranking response did not include output_text; falling back to heuristic scores.")
         return {}
 

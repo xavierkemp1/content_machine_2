@@ -36,6 +36,27 @@ OPENAI_RANKING_MODEL=gpt-4.1-mini
 OPENAI_REWRITE_MODEL=gpt-4.1-mini
 ```
 
+#### Piper TTS (optional)
+
+By default the pipeline generates a **silent WAV** as a placeholder for TTS audio.
+To enable real speech synthesis via [Piper](https://github.com/rhasspy/piper), set the following variables:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `PIPER_EXE` | Path to the `piper` executable | *(unset — uses silent stub)* |
+| `PIPER_VOICES_DIR` | Directory containing `.onnx` voice model files | *(required when `PIPER_EXE` is set)* |
+| `PIPER_VOICE` | Voice basename (without `.onnx`) | `en_GB-northern_english_male-medium` |
+
+Example (Windows):
+
+```dotenv
+PIPER_EXE=C:\Users\YourUsername\piper\piper.exe
+PIPER_VOICES_DIR=C:\Users\YourUsername\piper\voices
+PIPER_VOICE=en_GB-northern_english_male-medium
+```
+
+If `PIPER_EXE` is unset or the file does not exist the pipeline falls back to the silent stub automatically (offline-safe).
+
 Sources (Reddit subreddits, X accounts) and thresholds are configured in `config/sources.json`.
 
 ---
