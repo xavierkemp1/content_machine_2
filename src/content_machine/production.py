@@ -24,6 +24,22 @@ def _estimate_duration_seconds(narration: str, words_per_minute: int = 145) -> f
     return max(6.0, (words / max(80, words_per_minute)) * 60.0)
 
 
+def _get_wav_duration(wav_path: str) -> float:
+    """Return the exact duration in seconds of a WAV file using the wave module.
+
+    Returns 0.0 if the file cannot be read (missing, corrupt, or empty).
+    """
+    try:
+        with wave.open(wav_path, "r") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            if rate > 0 and frames > 0:
+                return frames / float(rate)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read WAV duration from %r: %s", wav_path, exc)
+    return 0.0
+
+
 def _generate_tts_stub(narration: str, output_path: Path) -> str:
     """Generate a silent WAV with narration-proportional duration as offline-safe TTS stub."""
 
@@ -54,13 +70,23 @@ def _generate_tts(narration: str, output_path: Path) -> str:
                      (default: ``en_GB-northern_english_male-medium``).
     """
     piper_exe = os.getenv("PIPER_EXE", "").strip()
-    if not piper_exe or not Path(piper_exe).is_file():
-        if piper_exe:
-            logger.warning(
-                "PIPER_EXE is set to %r but the file was not found; "
-                "falling back to silent TTS stub.",
-                piper_exe,
-            )
+    if not piper_exe:
+        logger.info(
+            "PIPER_EXE is not set — using silent TTS stub. "
+            "To enable real voice synthesis set PIPER_EXE to the full path of "
+            "the piper executable in your .env file "
+            "(e.g. PIPER_EXE=C:\\Users\\xavie\\OneDrive\\Documents\\piper\\piper.exe)."
+        )
+        return _generate_tts_stub(narration, output_path)
+
+    if not Path(piper_exe).is_file():
+        logger.warning(
+            "PIPER_EXE is set to %r but no file was found at that path. "
+            "Check that you have pointed to the piper executable itself "
+            "(e.g. piper.exe), not just its containing folder. "
+            "Falling back to silent TTS stub.",
+            piper_exe,
+        )
         return _generate_tts_stub(narration, output_path)
 
     voices_dir = os.getenv("PIPER_VOICES_DIR", "").strip()
@@ -69,8 +95,13 @@ def _generate_tts(narration: str, output_path: Path) -> str:
 
     if not model_path.is_file():
         logger.warning(
-            "Piper voice model not found at %r; falling back to silent TTS stub.",
+            "Piper voice model not found at %r. "
+            "Ensure PIPER_VOICES_DIR points to the folder containing *.onnx voice files "
+            "(e.g. PIPER_VOICES_DIR=C:\\Users\\xavie\\OneDrive\\Documents\\piper\\voices) "
+            "and that PIPER_VOICE matches a file in that folder without the .onnx extension "
+            "(current voice: %r). Falling back to silent TTS stub.",
             str(model_path),
+            voice,
         )
         return _generate_tts_stub(narration, output_path)
 
@@ -92,22 +123,32 @@ def _generate_tts(narration: str, output_path: Path) -> str:
             capture_output=True,
         )
         if result.returncode != 0:
+            stderr_excerpt = result.stderr[-500:] if result.stderr else "(no stderr)"
             logger.warning(
-                "Piper exited with code %d: %s; falling back to silent TTS stub.",
+                "Piper exited with code %d while generating %r.\n"
+                "  command:  %s\n"
+                "  stderr:   %s\n"
+                "Falling back to silent TTS stub.",
                 result.returncode,
-                result.stderr[-500:],
+                str(output_path),
+                " ".join(command),
+                stderr_excerpt,
             )
             return _generate_tts_stub(narration, output_path)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "Piper TTS failed (%s); falling back to silent TTS stub.",
-            exc,
+            "Piper TTS failed with exception %r while running %r — "
+            "falling back to silent TTS stub.",
+            str(exc),
+            " ".join(command),
         )
         return _generate_tts_stub(narration, output_path)
 
     if not output_path.exists() or output_path.stat().st_size == 0:
         logger.warning(
-            "Piper produced no output at %r; falling back to silent TTS stub.",
+            "Piper ran successfully (exit 0) but produced no output at %r. "
+            "The voice model may be incompatible with the installed Piper version. "
+            "Falling back to silent TTS stub.",
             str(output_path),
         )
         return _generate_tts_stub(narration, output_path)
@@ -116,12 +157,19 @@ def _generate_tts(narration: str, output_path: Path) -> str:
     return str(output_path)
 
 
-def _generate_subtitles(narration: str, output_path: Path) -> str:
+def _generate_subtitles(narration: str, output_path: Path, audio_duration: float | None = None) -> str:
+    """Write an SRT subtitle file whose timings fit exactly within *audio_duration*.
+
+    When *audio_duration* is ``None`` the duration is estimated from word count.
+    Chunk durations are allocated proportional to character count so that longer
+    chunks stay on screen longer; the final subtitle always ends at *audio_duration*.
+    """
     words = narration.split()
     chunk_size = 8
     chunks = [" ".join(words[i : i + chunk_size]) for i in range(0, len(words), chunk_size)] or [narration]
-    total_duration = _estimate_duration_seconds(narration)
-    chunk_duration = total_duration / max(1, len(chunks))
+    total_duration = audio_duration if (audio_duration and audio_duration > 0) else _estimate_duration_seconds(narration)
+
+    total_chars = max(1, sum(len(c) for c in chunks))
 
     def srt_time(seconds: float) -> str:
         ms = int(round(seconds * 1000))
@@ -132,9 +180,13 @@ def _generate_subtitles(narration: str, output_path: Path) -> str:
         return f"{hh:02d}:{mm:02d}:{ss:02d},{mmm:03d}"
 
     lines: list[str] = []
+    elapsed = 0.0
     for idx, chunk in enumerate(chunks, start=1):
-        start = (idx - 1) * chunk_duration
-        end = idx * chunk_duration
+        start = elapsed
+        chunk_fraction = len(chunk) / total_chars
+        elapsed += total_duration * chunk_fraction
+        # Last chunk must end exactly at total_duration for perfect sync
+        end = total_duration if idx == len(chunks) else elapsed
         lines.extend([str(idx), f"{srt_time(start)} --> {srt_time(end)}", chunk, ""])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -159,11 +211,32 @@ def _compose_video(
     audio_path: str,
     subtitles_path: str,
     output_path: Path,
+    audio_duration: float = 0.0,
+    timeout: int = 300,
+    verbose: bool = False,
 ) -> str:
     """Render a 9:16 black-background video with burned-in subtitles and audio.
 
-    Raises ``RuntimeError`` if ffmpeg is not found, if ffmpeg exits with a
-    non-zero return code, or if the output file is missing / empty after the run.
+    Parameters
+    ----------
+    audio_path:
+        Path to the source WAV audio file.
+    subtitles_path:
+        Path to the SRT subtitle file.
+    output_path:
+        Destination MP4 path.
+    audio_duration:
+        Exact audio duration in seconds.  When > 0 a ``-t`` flag is added so
+        ffmpeg cannot run past the end of the audio, preventing indefinite hangs.
+    timeout:
+        Maximum seconds to wait for ffmpeg before raising ``RuntimeError``.
+        Defaults to 300 s (5 min).  Set via ``FFMPEG_TIMEOUT`` env var.
+    verbose:
+        When ``True`` ffmpeg stdout/stderr are streamed to the console instead
+        of being captured.  Set via ``FFMPEG_VERBOSE=1`` env var.
+
+    Raises ``RuntimeError`` if ffmpeg is not found, times out, exits with a
+    non-zero return code, or produces a missing/empty output file.
     """
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
@@ -180,7 +253,7 @@ def _compose_video(
         ffmpeg_bin,
         "-hide_banner",
         "-loglevel",
-        "error",
+        "error" if not verbose else "info",
         "-y",
         "-f",
         "lavfi",
@@ -201,35 +274,108 @@ def _compose_video(
         "yuv420p",
         "-c:a",
         "aac",
-        str(output_path),
     ]
 
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        stderr_excerpt = result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr
+    if audio_duration > 0:
+        command += ["-t", f"{audio_duration:.3f}"]
+
+    command.append(str(output_path))
+
+    logger.info("ffmpeg command: %s", " ".join(command))
+    logger.info(
+        "Rendering video → %s  (build dir; final output expected in output/ by theme)",
+        output_path,
+    )
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=not verbose,
+            text=not verbose,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
         raise RuntimeError(
-            f"ffmpeg exited with code {result.returncode}:\n{stderr_excerpt}"
+            f"ffmpeg timed out after {timeout}s rendering {output_path}. "
+            "Check that ffmpeg is working correctly and that input files are valid.\n"
+            f"  audio:     {audio_path}\n"
+            f"  subtitles: {subtitles_path}"
+        )
+
+    if result.returncode != 0:
+        stderr_excerpt = ""
+        if result.stderr:
+            stderr_excerpt = result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr
+        raise RuntimeError(
+            f"ffmpeg exited with code {result.returncode} rendering {output_path}:\n"
+            f"{stderr_excerpt}\n"
+            f"  audio:     {audio_path}\n"
+            f"  subtitles: {subtitles_path}"
         )
 
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise RuntimeError(
-            f"ffmpeg produced no output or an empty file at {output_path}"
+            f"ffmpeg produced no output or an empty file at {output_path}\n"
+            f"  audio:     {audio_path}\n"
+            f"  subtitles: {subtitles_path}"
         )
 
     return str(output_path)
 
 
 def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> ProductionArtifact:
-    """Create TTS, subtitles, and compose a 9:16 black-screen video artifact."""
+    """Create TTS, subtitles, and compose a 9:16 black-screen video artifact.
+
+    Subtitle timings are derived from the *actual* WAV duration so captions
+    sync perfectly to the voice-over.  ffmpeg is constrained to that same
+    duration via ``-t`` to prevent indefinite hangs.
+
+    Environment variables
+    ---------------------
+    FFMPEG_TIMEOUT   Seconds before ffmpeg is killed (default: 300).
+    FFMPEG_VERBOSE   Set to ``1`` / ``true`` / ``yes`` to stream ffmpeg output
+                     to the console instead of capturing it silently.
+    """
 
     root = Path(work_dir)
     stem = f"{content.source_post.raw.source}-{_slugify(content.source_post.raw.source_id)}"
+
     audio_path = _generate_tts(content.narration, root / "audio" / f"{stem}.wav")
-    subtitles_path = _generate_subtitles(content.narration, root / "subs" / f"{stem}.srt")
+
+    # Derive exact duration from the generated WAV for accurate subtitle sync
+    audio_duration = _get_wav_duration(audio_path)
+    if audio_duration <= 0:
+        logger.warning(
+            "Could not determine audio duration for %r; subtitle timing will use estimate.",
+            audio_path,
+        )
+
+    subtitles_path = _generate_subtitles(
+        content.narration,
+        root / "subs" / f"{stem}.srt",
+        audio_duration=audio_duration if audio_duration > 0 else None,
+    )
+
+    verbose = os.getenv("FFMPEG_VERBOSE", "").strip().lower() in ("1", "true", "yes")
+    try:
+        timeout = int(os.getenv("FFMPEG_TIMEOUT", "300"))
+    except ValueError:
+        timeout = 300
+
     video_path = _compose_video(
         audio_path=audio_path,
         subtitles_path=subtitles_path,
         output_path=root / "videos" / f"{stem}.mp4",
+        audio_duration=audio_duration,
+        timeout=timeout,
+        verbose=verbose,
+    )
+
+    logger.info(
+        "Production complete for %r. Build artifacts in %s; "
+        "final exports expected in output/ organised by theme after export stage.",
+        stem,
+        root,
     )
 
     return ProductionArtifact(

@@ -40,9 +40,20 @@ def export_outputs(
         metadata_dest = destination / f"{stem}.json"
 
         source_video = Path(artifact.video_path)
-        if not source_video.exists() or source_video.stat().st_size == 0:
+        if not source_video.exists():
             raise RuntimeError(
-                f"Video artifact is missing or empty, aborting export: {source_video}"
+                f"Expected video artifact does not exist — cannot export.\n"
+                f"  missing file: {source_video}\n"
+                f"  This usually means ffmpeg failed silently during the production stage.\n"
+                f"  Re-run with FFMPEG_VERBOSE=1 in your .env to see full ffmpeg output, "
+                f"or check FFMPEG_TIMEOUT (default 300 s) if rendering stalled."
+            )
+        if source_video.stat().st_size == 0:
+            raise RuntimeError(
+                f"Video artifact exists but is 0 bytes — cannot export.\n"
+                f"  empty file: {source_video}\n"
+                f"  ffmpeg may have crashed or been interrupted before finishing. "
+                f"Re-run with FFMPEG_VERBOSE=1 to see full ffmpeg output."
             )
         shutil.copy2(source_video, video_dest)
 
