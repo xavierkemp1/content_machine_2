@@ -1,5 +1,45 @@
 # content_machine_2
 
+## Running locally
+
+**Requirements:** Python 3.11+
+
+```bash
+# 1) Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+
+# 2) Install the package in editable mode
+pip install -e .
+
+# 3) Copy the example env file and fill in your keys
+cp .env.example .env
+
+# 4) Run the pipeline
+python scripts/run_pipeline.py
+```
+
+### Required keys in `.env`
+
+| Variable | Purpose |
+|---|---|
+| `REDDIT_CLIENT_ID` | Reddit API client ID |
+| `REDDIT_CLIENT_SECRET` | Reddit API client secret |
+| `REDDIT_USER_AGENT` | Reddit API user agent string |
+| `TWITTERAPI_IO_KEY` | [twitterapi.io](https://twitterapi.io) API key — used instead of the official X Bearer Token |
+| `OPENAI_API_KEY` | OpenAI API key for ranking and rewriting |
+
+Optional model overrides (defaults shown):
+
+```dotenv
+OPENAI_RANKING_MODEL=gpt-4.1-mini
+OPENAI_REWRITE_MODEL=gpt-4.1-mini
+```
+
+Sources (Reddit subreddits, X accounts) and thresholds are configured in `config/sources.json`.
+
+---
+
 The purpose of this project is to automate the process of creating viral content, through the use of various APIs. The project will follow the below flow:
 
 1) Obtaining raw 'potential content'  
