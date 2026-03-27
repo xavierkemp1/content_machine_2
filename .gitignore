@@ -85,6 +85,8 @@ coverage/
 *.pid
 *.seed
 *.lock
+*.txt
+*.pyc
 
 # Keep lockfiles (important for reproducibility)
 !package-lock.json

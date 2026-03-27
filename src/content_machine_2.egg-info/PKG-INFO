@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: content-machine-2
+Version: 0.1.0
+Summary: Skeleton short-form content making pipeline
+Requires-Python: >=3.11
