@@ -72,7 +72,7 @@ def _openai_enhance(posts: list[RankedPost]) -> dict[str, dict[str, Any]]:
                 "role": "system",
                 "content": [
                     {
-                        "type": "text",
+                        "type": "input_text",
                         "text": (
                             "Rewrite each item for short-form delivery. Return JSON object with key "
                             "'items': [{source_id, title, hook, narration, caption, hashtags}] only."
@@ -82,7 +82,7 @@ def _openai_enhance(posts: list[RankedPost]) -> dict[str, dict[str, Any]]:
             },
             {
                 "role": "user",
-                "content": [{"type": "text", "text": json.dumps(prompt_data)}],
+                "content": [{"type": "input_text", "text": json.dumps(prompt_data)}],
             },
         ],
         "text": {"format": {"type": "json_object"}},

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import os
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import urlparse
 from urllib.request import Request
 
 from .config import load_json
@@ -17,10 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 _REDDIT_URL = "https://www.reddit.com/r/{subreddit}/top.json?t=day&limit=50"
-_X_SEARCH_URLS = (
-    "https://api.x.com/2/tweets/search/recent",
-    "https://api.twitter.com/2/tweets/search/recent",
-)
+_TWITTERAPI_IO_URL = "https://api.twitterapi.io/twitter/user/last_tweets"
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -113,15 +110,15 @@ def fetch_reddit_posts() -> list[RawPost]:
 
 
 def fetch_x_posts() -> list[RawPost]:
-    """Fetch and normalize X posts according to config thresholds."""
+    """Fetch and normalize X posts via twitterapi.io according to config thresholds."""
 
     cfg = load_json("config/sources.json").get("x", {})
     if not cfg.get("enabled", False):
         return []
 
-    bearer_token = os.getenv("X_BEARER_TOKEN", "").strip()
-    if not bearer_token:
-        logger.warning("Skipping X sourcing because X_BEARER_TOKEN is not set.")
+    api_key = os.getenv("TWITTERAPI_IO_KEY", "").strip()
+    if not api_key:
+        logger.warning("Skipping X sourcing because TWITTERAPI_IO_KEY is not set.")
         return []
 
     min_likes = int(cfg.get("min_likes", 0))
@@ -136,71 +133,53 @@ def fetch_x_posts() -> list[RawPost]:
         if not handle:
             continue
 
-        query = quote_plus(f"from:{handle} -is:retweet -is:reply lang:en")
-        url_suffix = (
-            f"?query={query}&max_results=50"
-            "&tweet.fields=created_at,public_metrics,entities,attachments"
-            "&expansions=author_id&user.fields=username"
-        )
-
-        payload: dict[str, Any] | None = None
-        for base_url in _X_SEARCH_URLS:
-            try:
-                payload = _request_json(
-                    f"{base_url}{url_suffix}",
-                    headers={"Authorization": f"Bearer {bearer_token}"},
-                )
-                break
-            except Exception:
-                payload = None
-
-        if not payload:
-            logger.error("Unable to fetch X posts for @%s after trying all configured API endpoints.", handle)
+        url = f"{_TWITTERAPI_IO_URL}?userName={handle}"
+        try:
+            payload = _request_json(url, headers={"X-API-Key": api_key})
+        except Exception:
+            logger.error("Unable to fetch tweets for @%s from twitterapi.io.", handle)
             continue
 
-        users = {
-            user.get("id", ""): user.get("username", "")
-            for user in payload.get("includes", {}).get("users", [])
-        }
+        for tweet in payload.get("tweets", []):
+            # Skip retweets and replies
+            text = (tweet.get("text") or "").strip()
+            if not text or text.startswith("RT ") or tweet.get("isReply"):
+                continue
 
-        for tweet in payload.get("data", []):
-            metrics = tweet.get("public_metrics", {})
-            likes = int(metrics.get("like_count", 0))
-            replies = int(metrics.get("reply_count", 0))
+            likes = int(tweet.get("likeCount", 0) or 0)
+            replies = int(tweet.get("replyCount", 0) or 0)
             if likes < min_likes or replies < min_replies:
                 continue
 
-            created_at_text = tweet.get("created_at", "")
-            created_at = _parse_datetime(created_at_text)
+            created_at = _parse_datetime(tweet.get("createdAt", ""))
             if not _is_within_lookback(created_at, lookback_hours):
                 continue
 
-            text = (tweet.get("text") or "").strip()
-            if not text:
-                continue
-
-            entity_urls = tweet.get("entities", {}).get("urls", [])
-            has_media = bool(tweet.get("attachments", {}).get("media_keys"))
+            tweet_id = str(tweet.get("id", ""))
+            author = (tweet.get("author") or {}).get("userName", handle)
+            entities = tweet.get("entities") or {}
+            entity_urls = entities.get("urls") or []
             has_external_url = bool(entity_urls)
-
-            author_id = tweet.get("author_id", "")
-            author = users.get(author_id, handle)
+            has_media = any(
+                urlparse(u.get("expanded_url") or "").hostname == "pic.twitter.com"
+                or urlparse(u.get("display_url") or "").hostname == "pic.twitter.com"
+                for u in entity_urls
+            )
 
             normalized.append(
                 RawPost(
                     source="x",
-                    source_id=str(tweet.get("id", "")),
+                    source_id=tweet_id,
                     author=author,
                     text=text,
                     metrics={
                         "likes": likes,
                         "replies": replies,
-                        "reposts": int(metrics.get("retweet_count", 0)),
-                        "quotes": int(metrics.get("quote_count", 0)),
-                        "bookmarks": int(metrics.get("bookmark_count", 0)),
-                        "views": int(metrics.get("impression_count", 0)),
+                        "reposts": int(tweet.get("retweetCount", 0) or 0),
+                        "quotes": int(tweet.get("quoteCount", 0) or 0),
+                        "views": int(tweet.get("viewCount", 0) or 0),
                         "account": handle,
-                        "url": f"https://x.com/{author}/status/{tweet.get('id', '')}",
+                        "url": tweet.get("url", f"https://x.com/{author}/status/{tweet_id}"),
                         "has_media": has_media,
                         "has_external_url": has_external_url,
                     },
