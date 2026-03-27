@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -62,47 +61,54 @@ def _generate_subtitles(narration: str, output_path: Path) -> str:
     return str(output_path)
 
 
-def _pick_background(content: EnhancedContent, assets_dir: Path) -> str:
-    """Choose matching background clip if available; otherwise use built-in ffmpeg color source."""
+def _escape_subtitles_filter_path(path: str) -> str:
+    """Return an ffmpeg-filter-safe subtitle path.
 
-    theme = str(content.source_post.raw.metrics.get("subreddit") or content.source_post.raw.metrics.get("account") or "")
-    candidates = [f"{_slugify(theme)}.mp4", f"{content.source_post.raw.source}.mp4", "default.mp4"]
-    for candidate in candidates:
-        path = assets_dir / candidate
-        if path.exists():
-            return str(path)
-    return ""
+    Resolves to an absolute path, converts backslashes to forward slashes, and
+    escapes the drive-letter colon (e.g. ``C:`` → ``C\\:``) so the path is
+    valid inside an ffmpeg ``-vf`` filter expression on Windows.
+    """
+    resolved = str(Path(path).resolve()).replace("\\", "/")
+    if len(resolved) >= 2 and resolved[1] == ":":
+        resolved = resolved[0] + r"\:" + resolved[2:]
+    return resolved
 
 
 def _compose_video(
     audio_path: str,
     subtitles_path: str,
-    background_path: str,
     output_path: Path,
 ) -> str:
+    """Render a 9:16 black-background video with burned-in subtitles and audio.
+
+    Raises ``RuntimeError`` if ffmpeg is not found, if ffmpeg exits with a
+    non-zero return code, or if the output file is missing / empty after the run.
+    """
     ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError(
+            "ffmpeg not found on PATH. Install ffmpeg and ensure it is accessible."
+        )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if not ffmpeg_bin:
-        output_path.touch()
-        return str(output_path)
-
-    input_args: list[str]
-    video_filter = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-    if background_path:
-        input_args = ["-stream_loop", "-1", "-i", background_path]
-    else:
-        input_args = ["-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=30"]
-        video_filter = "format=yuv420p"
+    escaped_subs = _escape_subtitles_filter_path(subtitles_path)
+    vf = f"format=yuv420p,subtitles='{escaped_subs}'"
 
     command = [
         ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-y",
-        *input_args,
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=1080x1920:r=30",
         "-i",
         audio_path,
         "-vf",
-        f"{video_filter},subtitles={subtitles_path}",
+        vf,
         "-map",
         "0:v:0",
         "-map",
@@ -117,25 +123,31 @@ def _compose_video(
         str(output_path),
     ]
 
-    with contextlib.suppress(Exception):
-        subprocess.run(command, check=True, capture_output=True, text=True)
-    if not output_path.exists():
-        output_path.touch()
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr_excerpt = result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr
+        raise RuntimeError(
+            f"ffmpeg exited with code {result.returncode}:\n{stderr_excerpt}"
+        )
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError(
+            f"ffmpeg produced no output or an empty file at {output_path}"
+        )
+
     return str(output_path)
 
 
 def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> ProductionArtifact:
-    """Create TTS, subtitles, choose background, and compose a 9:16 video artifact."""
+    """Create TTS, subtitles, and compose a 9:16 black-screen video artifact."""
 
     root = Path(work_dir)
     stem = f"{content.source_post.raw.source}-{_slugify(content.source_post.raw.source_id)}"
     audio_path = _generate_tts_stub(content.narration, root / "audio" / f"{stem}.wav")
     subtitles_path = _generate_subtitles(content.narration, root / "subs" / f"{stem}.srt")
-    background_path = _pick_background(content, root / "backgrounds")
     video_path = _compose_video(
         audio_path=audio_path,
         subtitles_path=subtitles_path,
-        background_path=background_path,
         output_path=root / "videos" / f"{stem}.mp4",
     )
 
@@ -144,7 +156,7 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
         subtitles_path=subtitles_path,
         metadata_path="",
         audio_path=audio_path,
-        background_path=background_path,
+        background_path="",
     )
 
 
