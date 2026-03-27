@@ -188,10 +188,10 @@ def _openai_rank(posts: list[RawPost]) -> dict[str, dict[str, Any]]:
     payload = {
         "model": model,
         "input": [
-            {"role": "system", "content": [{"type": "text", "text": prompt}]},
+            {"role": "system", "content": [{"type": "input_text", "text": prompt}]},
             {
                 "role": "user",
-                "content": [{"type": "text", "text": json.dumps(prompt_data)}],
+                "content": [{"type": "input_text", "text": json.dumps(prompt_data)}],
             },
         ],
         "text": {"format": {"type": "json_object"}},
