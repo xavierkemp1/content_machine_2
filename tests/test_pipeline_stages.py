@@ -341,5 +341,188 @@ class TestPipelineStages(unittest.TestCase):
                 os.environ["OPENAI_API_KEY"] = original_key
 
 
+    # ------------------------------------------------------------------
+    # _get_wav_duration tests
+    # ------------------------------------------------------------------
+
+    def test_get_wav_duration_returns_correct_duration(self):
+        """_get_wav_duration reads the exact duration from a WAV file written by the wave module."""
+        from content_machine.production import _get_wav_duration
+        import wave
+
+        sample_rate = 22050
+        duration_s = 3.0
+        frames = int(duration_s * sample_rate)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+        try:
+            with wave.open(tmp_path, "w") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(b"\x00\x00" * frames)
+            result = _get_wav_duration(tmp_path)
+            self.assertAlmostEqual(result, duration_s, places=2)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    def test_get_wav_duration_returns_zero_for_missing_file(self):
+        """_get_wav_duration returns 0.0 when the WAV file does not exist."""
+        from content_machine.production import _get_wav_duration
+        result = _get_wav_duration("/nonexistent/path/audio.wav")
+        self.assertEqual(result, 0.0)
+
+    # ------------------------------------------------------------------
+    # _generate_subtitles timing tests
+    # ------------------------------------------------------------------
+
+    def test_generate_subtitles_final_end_matches_audio_duration(self):
+        """The last SRT entry must end exactly at the given audio_duration."""
+        from content_machine.production import _generate_subtitles
+        narration = "one two three four five six seven eight nine ten eleven twelve"
+        audio_duration = 7.5
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "subs.srt"
+            _generate_subtitles(narration, out, audio_duration=audio_duration)
+            content = out.read_text(encoding="utf-8")
+        # Last timestamp line ends with the HH:MM:SS,mmm for audio_duration
+        # 7.5 s → 00:00:07,500
+        self.assertIn("00:00:07,500", content)
+
+    def test_generate_subtitles_proportional_chunks(self):
+        """Longer chunks (more characters) get more on-screen time than shorter ones."""
+        from content_machine.production import _generate_subtitles
+        # Two clean 8-word groups: first group has very short words, second has very long words.
+        # chunk_size=8 means chunking splits exactly at word 9.
+        short_words = " ".join(["a"] * 8)           # 8 one-letter words → ~15 chars
+        long_words  = " ".join(["superlongword"] * 8)  # 8 long words → ~111 chars
+        narration = short_words + " " + long_words
+        audio_duration = 10.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "subs.srt"
+            _generate_subtitles(narration, out, audio_duration=audio_duration)
+            lines = out.read_text(encoding="utf-8").splitlines()
+        # Extract end times from timestamp lines (contain " --> ")
+        end_times: list[float] = []
+        for line in lines:
+            if " --> " in line:
+                end_str = line.split(" --> ")[1].strip()
+                h, m, rest = end_str.split(":")
+                s, ms = rest.split(",")
+                end_times.append(int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000)
+        self.assertEqual(len(end_times), 2)
+        # First chunk (short words) ends well before midpoint
+        self.assertLess(end_times[0], audio_duration / 2)
+        # Last chunk ends exactly at audio_duration
+        self.assertAlmostEqual(end_times[-1], audio_duration, places=2)
+
+    def test_generate_subtitles_falls_back_to_estimate_when_no_duration(self):
+        """When audio_duration is None, subtitles are still written without error."""
+        from content_machine.production import _generate_subtitles
+        narration = "hello world this is a test of the subtitle generation code"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "subs.srt"
+            result = _generate_subtitles(narration, out, audio_duration=None)
+            self.assertTrue(Path(result).exists())
+            self.assertGreater(Path(result).stat().st_size, 0)
+
+    # ------------------------------------------------------------------
+    # _compose_video timeout / error message tests
+    # ------------------------------------------------------------------
+
+    def test_compose_video_timeout_raises_runtime_error(self):
+        """A TimeoutExpired from subprocess is converted to RuntimeError with path info."""
+        import subprocess
+        import unittest.mock as mock
+        from content_machine.production import _compose_video
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio = Path(tmpdir) / "a.wav"
+            subs = Path(tmpdir) / "s.srt"
+            audio.write_bytes(b"\x00" * 100)
+            subs.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi\n", encoding="utf-8")
+            out = Path(tmpdir) / "v.mp4"
+
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+                 mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("ffmpeg", 1)):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _compose_video(str(audio), str(subs), out, timeout=1)
+
+        msg = str(ctx.exception)
+        self.assertIn("timed out", msg)
+        self.assertIn(str(audio), msg)
+        self.assertIn(str(subs), msg)
+
+    def test_compose_video_nonzero_exit_includes_stderr_and_paths(self):
+        """Non-zero ffmpeg exit code produces RuntimeError with stderr excerpt and file paths."""
+        import subprocess
+        import unittest.mock as mock
+        from content_machine.production import _compose_video
+
+        fake_result = mock.MagicMock()
+        fake_result.returncode = 1
+        fake_result.stderr = "Error opening filters!"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio = Path(tmpdir) / "a.wav"
+            subs = Path(tmpdir) / "s.srt"
+            audio.write_bytes(b"\x00" * 100)
+            subs.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi\n", encoding="utf-8")
+            out = Path(tmpdir) / "v.mp4"
+
+            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+                 mock.patch("subprocess.run", return_value=fake_result):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _compose_video(str(audio), str(subs), out)
+
+        msg = str(ctx.exception)
+        self.assertIn("Error opening filters!", msg)
+        self.assertIn(str(audio), msg)
+        self.assertIn(str(subs), msg)
+
+    # ------------------------------------------------------------------
+    # Piper TTS – improved error message tests
+    # ------------------------------------------------------------------
+
+    def test_generate_tts_piper_exe_points_to_folder_warns_clearly(self):
+        """When PIPER_EXE is a directory (not an exe), the warning says so clearly."""
+        from content_machine.production import _generate_tts
+        env_backup = os.environ.get("PIPER_EXE")
+        # Use a path that exists (the tmpdir itself) but is a directory, not a file
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["PIPER_EXE"] = tmpdir  # folder, not file
+            out = Path(tmpdir) / "audio" / "out.wav"
+            with self.assertLogs("content_machine.production", level="WARNING") as cm:
+                result = _generate_tts("hello", out)
+            # Should fall back to stub successfully
+            self.assertTrue(Path(result).exists())
+            # Warning must tell user to point to the exe, not the folder
+            joined = "\n".join(cm.output)
+            self.assertIn("executable", joined.lower())
+        if env_backup is None:
+            os.environ.pop("PIPER_EXE", None)
+        else:
+            os.environ["PIPER_EXE"] = env_backup
+
+    # ------------------------------------------------------------------
+    # pipeline.run_pipeline – error propagation test
+    # ------------------------------------------------------------------
+
+    def test_pipeline_reraises_runtime_error_from_stage(self):
+        """run_pipeline must re-raise RuntimeError so the caller sees it."""
+        original_collect = pipeline.collect_raw_posts
+
+        def always_fail():
+            raise RuntimeError("sourcing exploded")
+
+        try:
+            pipeline.collect_raw_posts = always_fail
+            with self.assertRaises(RuntimeError):
+                pipeline.run_pipeline()
+        finally:
+            pipeline.collect_raw_posts = original_collect
+
+
 if __name__ == "__main__":
     unittest.main()
