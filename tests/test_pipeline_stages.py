@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +67,8 @@ class TestPipelineStages(unittest.TestCase):
             caption="Caption",
             hashtags=["#test"],
         )
+        if not shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg not available in this environment")
         with tempfile.TemporaryDirectory() as tmpdir:
             artifact = production.render_video(content, work_dir=tmpdir)
             self.assertTrue(Path(artifact.audio_path).exists())
@@ -88,7 +91,7 @@ class TestPipelineStages(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             video = Path(tmpdir) / "v.mp4"
             subs = Path(tmpdir) / "s.srt"
-            video.write_bytes(b"")
+            video.write_bytes(b"fake mp4 content")  # non-empty so export guard passes
             subs.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
             artifact = ProductionArtifact(video_path=str(video), subtitles_path=str(subs), metadata_path="", audio_path="a.wav")
             exported = exporting.export_outputs([(content, artifact)], base_dir=tmpdir)
@@ -98,6 +101,76 @@ class TestPipelineStages(unittest.TestCase):
             self.assertTrue(metadata_path.exists())
             payload = json.loads(metadata_path.read_text(encoding="utf-8"))
             self.assertEqual("My title", payload["title"])
+
+    def test_exporting_raises_on_empty_video(self):
+        """export_outputs must raise RuntimeError when the source video is 0 bytes."""
+        content = EnhancedContent(
+            source_post=RankedPost(
+                raw=RawPost(source="reddit", source_id="99", author="u", text="text", metrics={"subreddit": "test"}),
+                length_bucket="short",
+                viral_score=50.0,
+            ),
+            title="T",
+            hook="H",
+            narration="N",
+            caption="C",
+            hashtags=[],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video = Path(tmpdir) / "empty.mp4"
+            subs = Path(tmpdir) / "s.srt"
+            video.write_bytes(b"")  # 0-byte file
+            subs.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+            artifact = ProductionArtifact(video_path=str(video), subtitles_path=str(subs), metadata_path="", audio_path="a.wav")
+            with self.assertRaises(RuntimeError):
+                exporting.export_outputs([(content, artifact)], base_dir=tmpdir)
+
+    def test_exporting_raises_on_missing_video(self):
+        """export_outputs must raise RuntimeError when the source video does not exist."""
+        content = EnhancedContent(
+            source_post=RankedPost(
+                raw=RawPost(source="reddit", source_id="100", author="u", text="text", metrics={"subreddit": "test"}),
+                length_bucket="short",
+                viral_score=50.0,
+            ),
+            title="T",
+            hook="H",
+            narration="N",
+            caption="C",
+            hashtags=[],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact = ProductionArtifact(video_path=str(Path(tmpdir) / "nonexistent.mp4"), subtitles_path="", metadata_path="", audio_path="")
+            with self.assertRaises(RuntimeError):
+                exporting.export_outputs([(content, artifact)], base_dir=tmpdir)
+
+    def test_escape_subtitles_filter_path_no_backslashes(self):
+        """_escape_subtitles_filter_path returns a path with no unescaped backslashes."""
+        from content_machine.production import _escape_subtitles_filter_path
+        with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as f:
+            tmp_path = f.name
+        try:
+            result = _escape_subtitles_filter_path(tmp_path)
+            # Remove escaped colons before checking for stray backslashes
+            cleaned = result.replace(r"\:", "")
+            self.assertNotIn("\\", cleaned)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    def test_escape_subtitles_filter_path_drive_letter_colon(self):
+        """Drive-letter colon is escaped when the resolved path contains one."""
+        from content_machine.production import _escape_subtitles_filter_path
+        import os
+        if os.name != "nt":
+            self.skipTest("Drive-letter colon escaping is only relevant on Windows")
+        with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as f:
+            tmp_path = f.name
+        try:
+            result = _escape_subtitles_filter_path(tmp_path)
+            # e.g. C\:/Users/... — the drive letter colon must be escaped
+            self.assertRegex(result, r"^[A-Za-z]\\:")
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
     def test_pipeline_calls_all_stages(self):
         called = []

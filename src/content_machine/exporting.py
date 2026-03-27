@@ -40,10 +40,11 @@ def export_outputs(
         metadata_dest = destination / f"{stem}.json"
 
         source_video = Path(artifact.video_path)
-        if source_video.exists():
-            shutil.copy2(source_video, video_dest)
-        else:
-            video_dest.touch()
+        if not source_video.exists() or source_video.stat().st_size == 0:
+            raise RuntimeError(
+                f"Video artifact is missing or empty, aborting export: {source_video}"
+            )
+        shutil.copy2(source_video, video_dest)
 
         source_subs = Path(artifact.subtitles_path)
         if source_subs.exists():
