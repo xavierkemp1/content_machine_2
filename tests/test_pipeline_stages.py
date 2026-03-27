@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -198,6 +199,146 @@ class TestPipelineStages(unittest.TestCase):
             pipeline.export_outputs = original_export
 
         self.assertEqual(["collect", "filter", "rank", "enhance", "produce", "export"], called)
+
+    # ------------------------------------------------------------------
+    # Piper TTS tests
+    # ------------------------------------------------------------------
+
+    def test_generate_tts_no_piper_exe_uses_stub(self):
+        """When PIPER_EXE is not set, _generate_tts falls back to the silent stub."""
+        from content_machine.production import _generate_tts
+        env_backup = os.environ.pop("PIPER_EXE", None)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out = Path(tmpdir) / "audio" / "test.wav"
+                result = _generate_tts("Hello world", out)
+                self.assertEqual(result, str(out))
+                self.assertTrue(out.exists())
+                self.assertGreater(out.stat().st_size, 0)
+        finally:
+            if env_backup is not None:
+                os.environ["PIPER_EXE"] = env_backup
+
+    def test_generate_tts_missing_exe_warns_and_uses_stub(self):
+        """When PIPER_EXE points to a non-existent file, log warning and use stub."""
+        from content_machine.production import _generate_tts
+        import logging
+        env_backup = os.environ.get("PIPER_EXE")
+        os.environ["PIPER_EXE"] = "/nonexistent/path/to/piper"
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out = Path(tmpdir) / "audio" / "test.wav"
+                with self.assertLogs("content_machine.production", level=logging.WARNING):
+                    result = _generate_tts("Hello world", out)
+                self.assertEqual(result, str(out))
+                self.assertTrue(out.exists())
+        finally:
+            if env_backup is None:
+                os.environ.pop("PIPER_EXE", None)
+            else:
+                os.environ["PIPER_EXE"] = env_backup
+
+    # ------------------------------------------------------------------
+    # OpenAI ranking response parsing tests
+    # ------------------------------------------------------------------
+
+    def test_openai_rank_output_text_field(self):
+        """_openai_rank correctly parses the legacy output_text field."""
+        from content_machine import filtering as flt
+        scores_json = json.dumps({"scores": [{"source_id": "abc", "score": 80.0, "reasons": {}}]})
+        fake_body = {"output_text": scores_json}
+
+        original_fn = flt.request_json_with_retries
+        flt.request_json_with_retries = lambda *a, **kw: fake_body
+        original_key = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = "test-key"
+        try:
+            post = RawPost(source="reddit", source_id="abc", author="u", text="x " * 20, metrics={})
+            result = flt._openai_rank([post])
+            self.assertIn("abc", result)
+            self.assertAlmostEqual(result["abc"]["score"], 80.0)
+        finally:
+            flt.request_json_with_retries = original_fn
+            if original_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = original_key
+
+    def test_openai_rank_output_array_field(self):
+        """_openai_rank correctly parses the modern output array format."""
+        from content_machine import filtering as flt
+        scores_json = json.dumps({"scores": [{"source_id": "xyz", "score": 90.0, "reasons": {}}]})
+        fake_body = {
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": scores_json}
+                    ],
+                }
+            ]
+        }
+
+        original_fn = flt.request_json_with_retries
+        flt.request_json_with_retries = lambda *a, **kw: fake_body
+        original_key = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = "test-key"
+        try:
+            post = RawPost(source="reddit", source_id="xyz", author="u", text="x " * 20, metrics={})
+            result = flt._openai_rank([post])
+            self.assertIn("xyz", result)
+            self.assertAlmostEqual(result["xyz"]["score"], 90.0)
+        finally:
+            flt.request_json_with_retries = original_fn
+            if original_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = original_key
+
+    def test_openai_rank_missing_output_falls_back(self):
+        """_openai_rank returns empty dict when no output is present."""
+        from content_machine import filtering as flt
+        fake_body = {"id": "resp_123", "model": "gpt-4.1-mini"}
+
+        original_fn = flt.request_json_with_retries
+        flt.request_json_with_retries = lambda *a, **kw: fake_body
+        original_key = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = "test-key"
+        try:
+            post = RawPost(source="reddit", source_id="nope", author="u", text="x " * 20, metrics={})
+            import logging
+            with self.assertLogs("content_machine.filtering", level=logging.ERROR):
+                result = flt._openai_rank([post])
+            self.assertEqual(result, {})
+        finally:
+            flt.request_json_with_retries = original_fn
+            if original_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = original_key
+
+    def test_openai_rank_invalid_json_falls_back(self):
+        """_openai_rank returns empty dict when output text is not valid JSON."""
+        from content_machine import filtering as flt
+        fake_body = {"output_text": "not valid json {{{{"}
+
+        original_fn = flt.request_json_with_retries
+        flt.request_json_with_retries = lambda *a, **kw: fake_body
+        original_key = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = "test-key"
+        try:
+            post = RawPost(source="reddit", source_id="bad", author="u", text="x " * 20, metrics={})
+            import logging
+            with self.assertLogs("content_machine.filtering", level=logging.ERROR):
+                result = flt._openai_rank([post])
+            self.assertEqual(result, {})
+        finally:
+            flt.request_json_with_retries = original_fn
+            if original_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = original_key
 
 
 if __name__ == "__main__":
