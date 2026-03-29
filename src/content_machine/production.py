@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import wave
@@ -194,6 +195,89 @@ def _generate_subtitles(narration: str, output_path: Path, audio_duration: float
     return str(output_path)
 
 
+def _probe_media_duration_seconds(media_path: Path) -> float:
+    """Read media duration using ffprobe; return 0.0 if unavailable."""
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffprobe_bin:
+        return 0.0
+
+    command = [
+        ffprobe_bin,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(media_path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return 0.0
+        return max(0.0, float((result.stdout or "").strip() or 0.0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _select_background_clips(background_dir: Path, target_duration: float) -> list[Path]:
+    """Select random clips and repeat as needed until *target_duration* is covered."""
+    supported_suffixes = {".mp4", ".mov", ".mkv", ".webm"}
+    clips = sorted(
+        path
+        for path in background_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in supported_suffixes
+    )
+    if not clips:
+        raise RuntimeError(
+            f"No background clips found in {background_dir}. "
+            "Add .mp4 (or .mov/.mkv/.webm) clips to this folder."
+        )
+
+    if target_duration <= 0:
+        return [random.choice(clips)]
+
+    selected: list[Path] = []
+    total = 0.0
+    attempts = 0
+    max_attempts = max(20, len(clips) * 10)
+    while total < target_duration:
+        attempts += 1
+        if attempts > max_attempts and not selected:
+            raise RuntimeError(
+                "Could not determine durations for background clips via ffprobe. "
+                "Ensure clips are valid media files and ffprobe is installed."
+            )
+        if attempts > max_attempts and selected:
+            logger.warning(
+                "Background selection ended early after %d attempts; accumulated %.2fs for target %.2fs.",
+                attempts,
+                total,
+                target_duration,
+            )
+            break
+        clip = random.choice(clips)
+        duration = _probe_media_duration_seconds(clip)
+        if duration <= 0:
+            logger.warning("Could not probe duration for background clip %s; skipping.", clip)
+            continue
+        selected.append(clip)
+        total += duration
+
+    return selected
+
+
+def _write_concat_manifest(clips: list[Path], manifest_path: Path) -> str:
+    """Write ffmpeg concat demuxer file for clip list."""
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for clip in clips:
+        clip_path = str(clip.resolve()).replace("'", "'\\''")
+        lines.append(f"file '{clip_path}'")
+    manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(manifest_path)
+
+
 def _escape_subtitles_filter_path(path: str) -> str:
     """Return an ffmpeg-filter-safe subtitle path.
 
@@ -210,12 +294,13 @@ def _escape_subtitles_filter_path(path: str) -> str:
 def _compose_video(
     audio_path: str,
     subtitles_path: str,
+    background_manifest_path: str,
     output_path: Path,
     audio_duration: float = 0.0,
     timeout: int = 300,
     verbose: bool = False,
 ) -> str:
-    """Render a 9:16 black-background video with burned-in subtitles and audio.
+    """Render a 9:16 background video with burned-in subtitles and audio.
 
     Parameters
     ----------
@@ -247,7 +332,12 @@ def _compose_video(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     escaped_subs = _escape_subtitles_filter_path(subtitles_path)
-    vf = f"format=yuv420p,subtitles='{escaped_subs}'"
+    vf = (
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,"
+        f"subtitles='{escaped_subs}',"
+        "format=yuv420p"
+    )
 
     command = [
         ffmpeg_bin,
@@ -256,9 +346,11 @@ def _compose_video(
         "error" if not verbose else "info",
         "-y",
         "-f",
-        "lavfi",
+        "concat",
+        "-safe",
+        "0",
         "-i",
-        "color=c=black:s=1080x1920:r=30",
+        background_manifest_path,
         "-i",
         audio_path,
         "-vf",
@@ -324,7 +416,7 @@ def _compose_video(
 
 
 def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> ProductionArtifact:
-    """Create TTS, subtitles, and compose a 9:16 black-screen video artifact.
+    """Create TTS, subtitles, and compose a 9:16 background video artifact.
 
     Subtitle timings are derived from the *actual* WAV duration so captions
     sync perfectly to the voice-over.  ffmpeg is constrained to that same
@@ -355,6 +447,17 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
         root / "subs" / f"{stem}.srt",
         audio_duration=audio_duration if audio_duration > 0 else None,
     )
+    background_dir = Path(os.getenv("BACKGROUND_CLIPS_DIR", "background_clips"))
+    if not background_dir.is_absolute():
+        background_dir = Path.cwd() / background_dir
+    selected_backgrounds = _select_background_clips(
+        background_dir=background_dir,
+        target_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(content.narration),
+    )
+    manifest_path = _write_concat_manifest(
+        selected_backgrounds,
+        root / "backgrounds" / f"{stem}.txt",
+    )
 
     verbose = os.getenv("FFMPEG_VERBOSE", "").strip().lower() in ("1", "true", "yes")
     try:
@@ -365,6 +468,7 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
     video_path = _compose_video(
         audio_path=audio_path,
         subtitles_path=subtitles_path,
+        background_manifest_path=manifest_path,
         output_path=root / "videos" / f"{stem}.mp4",
         audio_duration=audio_duration,
         timeout=timeout,
@@ -383,7 +487,7 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
         subtitles_path=subtitles_path,
         metadata_path="",
         audio_path=audio_path,
-        background_path="",
+        background_path="|".join(str(path) for path in selected_backgrounds),
     )
 
 

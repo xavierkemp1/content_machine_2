@@ -173,6 +173,44 @@ class TestPipelineStages(unittest.TestCase):
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
+    def test_select_background_clips_reaches_target_duration(self):
+        from content_machine import production as prod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bg_dir = Path(tmpdir) / "background_clips"
+            bg_dir.mkdir(parents=True, exist_ok=True)
+            for name in ("a.mp4", "b.mp4"):
+                (bg_dir / name).write_bytes(b"fake")
+
+            original_probe = prod._probe_media_duration_seconds
+            original_choice = prod.random.choice
+            try:
+                prod._probe_media_duration_seconds = lambda _path: 1.5
+                prod.random.choice = lambda seq: seq[0]
+                clips = prod._select_background_clips(bg_dir, target_duration=4.0)
+            finally:
+                prod._probe_media_duration_seconds = original_probe
+                prod.random.choice = original_choice
+
+            self.assertGreaterEqual(len(clips), 3)
+            self.assertTrue(all(path.suffix == ".mp4" for path in clips))
+
+    def test_write_concat_manifest_contains_clip_paths(self):
+        from content_machine.production import _write_concat_manifest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clip1 = Path(tmpdir) / "clip 1.mp4"
+            clip2 = Path(tmpdir) / "clip2.mp4"
+            clip1.write_bytes(b"1")
+            clip2.write_bytes(b"2")
+            manifest = Path(tmpdir) / "manifest.txt"
+            manifest_path = _write_concat_manifest([clip1, clip2], manifest)
+
+            body = Path(manifest_path).read_text(encoding="utf-8")
+            self.assertIn("file '", body)
+            self.assertIn(str(clip1.resolve()), body)
+            self.assertIn(str(clip2.resolve()), body)
+
     def test_pipeline_calls_all_stages(self):
         called = []
         original_collect = pipeline.collect_raw_posts
@@ -440,14 +478,16 @@ class TestPipelineStages(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             audio = Path(tmpdir) / "a.wav"
             subs = Path(tmpdir) / "s.srt"
+            manifest = Path(tmpdir) / "bg.txt"
             audio.write_bytes(b"\x00" * 100)
             subs.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi\n", encoding="utf-8")
+            manifest.write_text("file '/tmp/fake.mp4'\n", encoding="utf-8")
             out = Path(tmpdir) / "v.mp4"
 
             with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
-                 mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("ffmpeg", 1)):
+                mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("ffmpeg", 1)):
                 with self.assertRaises(RuntimeError) as ctx:
-                    _compose_video(str(audio), str(subs), out, timeout=1)
+                    _compose_video(str(audio), str(subs), str(manifest), out, timeout=1)
 
         msg = str(ctx.exception)
         self.assertIn("timed out", msg)
@@ -467,14 +507,16 @@ class TestPipelineStages(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             audio = Path(tmpdir) / "a.wav"
             subs = Path(tmpdir) / "s.srt"
+            manifest = Path(tmpdir) / "bg.txt"
             audio.write_bytes(b"\x00" * 100)
             subs.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi\n", encoding="utf-8")
+            manifest.write_text("file '/tmp/fake.mp4'\n", encoding="utf-8")
             out = Path(tmpdir) / "v.mp4"
 
             with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
-                 mock.patch("subprocess.run", return_value=fake_result):
+                mock.patch("subprocess.run", return_value=fake_result):
                 with self.assertRaises(RuntimeError) as ctx:
-                    _compose_video(str(audio), str(subs), out)
+                    _compose_video(str(audio), str(subs), str(manifest), out)
 
         msg = str(ctx.exception)
         self.assertIn("Error opening filters!", msg)
