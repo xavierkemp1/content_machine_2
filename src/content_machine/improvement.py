@@ -1,4 +1,4 @@
-"""Stage 3: rewrite selected posts for short-form delivery."""
+"""Stage 3: lightly copy-edit selected posts for short-form delivery."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from difflib import SequenceMatcher
 from typing import Any
 from urllib.request import Request
 
@@ -39,11 +40,11 @@ def _fallback_enhancement(post: RankedPost) -> EnhancedContent:
     lines = _clean_lines(post.raw.text)
     first = lines[0] if lines else post.raw.text
     hook = first if len(first) <= 130 else f"{first[:127].rstrip()}..."
-    narration = normalize_tts_text(" ".join(lines))
+    final_script = normalize_tts_text(" ".join(lines))
     title = hook[:70].strip(".!?") or "Story time"
     caption = f"{title} — would you have handled it the same way?"
 
-    hashtag_tokens = re.findall(r"[a-z0-9]+", narration.lower())
+    hashtag_tokens = re.findall(r"[a-z0-9]+", final_script.lower())
     unique = []
     for token in hashtag_tokens:
         if len(token) < 4 or token in unique:
@@ -57,40 +58,44 @@ def _fallback_enhancement(post: RankedPost) -> EnhancedContent:
         source_post=post,
         title=title,
         hook=hook,
-        narration=narration,
+        narration=final_script,
         caption=caption,
-        rewritten_caption_script=" ".join(lines),
-        rewritten_tts_script=narration,
+        final_script=final_script,
+        rewritten_caption_script=final_script,
+        rewritten_tts_script=final_script,
         hashtags=hashtags,
     )
 
 
-def _normalize_script_outputs(ai_row: dict[str, Any], fallback: EnhancedContent) -> tuple[str, str]:
-    """Return (caption_script, tts_script) with sensible fallback behaviour."""
-    caption_script = str(
-        ai_row.get("rewritten_caption_script")
-        or ai_row.get("caption_script")
-        or ai_row.get("caption")
-        or ""
-    ).strip()
-    tts_script = str(
-        ai_row.get("rewritten_tts_script")
+def _extract_candidate_final_script(ai_row: dict[str, Any]) -> str:
+    return str(
+        ai_row.get("final_script")
+        or ai_row.get("rewritten_tts_script")
+        or ai_row.get("rewritten_caption_script")
         or ai_row.get("tts_script")
+        or ai_row.get("caption_script")
         or ai_row.get("narration")
         or ""
     ).strip()
 
-    if caption_script and not tts_script:
-        tts_script = caption_script
-    elif tts_script and not caption_script:
-        caption_script = tts_script
 
-    if not caption_script:
-        caption_script = fallback.rewritten_caption_script or fallback.narration
-    if not tts_script:
-        tts_script = fallback.rewritten_tts_script or fallback.narration
+def _is_too_far_from_source(source_text: str, edited_text: str) -> bool:
+    if not edited_text.strip():
+        return True
+    source_words = source_text.split()
+    edited_words = edited_text.split()
+    if not source_words:
+        return False
 
-    return caption_script, normalize_tts_text(tts_script)
+    edited_ratio = len(edited_words) / max(1, len(source_words))
+    min_ratio = float(os.getenv("OPENAI_EDIT_MIN_WORD_RATIO", "0.75"))
+    max_ratio = float(os.getenv("OPENAI_EDIT_MAX_WORD_RATIO", "1.35"))
+    if edited_ratio < min_ratio or edited_ratio > max_ratio:
+        return True
+
+    similarity = SequenceMatcher(None, source_text.lower(), edited_text.lower()).ratio()
+    min_similarity = float(os.getenv("OPENAI_EDIT_MIN_SIMILARITY", "0.60"))
+    return similarity < min_similarity
 
 
 def _extract_response_output_text(body: dict[str, Any]) -> str:
@@ -174,14 +179,13 @@ def _openai_enhance_batch(posts: list[RankedPost], model: str, api_key: str) -> 
                     {
                         "type": "input_text",
                         "text": (
-                            "Rewrite each item for short-form delivery. Return JSON object with key "
-                            "'items': [{source_id, title, hook, rewritten_caption_script, "
-                            "rewritten_tts_script, narration, caption, hashtags}] only. "
-                            "Rules: rewritten_caption_script must be concise and punchy for on-screen "
-                            "captions. rewritten_tts_script must be optimized for natural narration "
-                            "with spoken-friendly wording, explicit abbreviation expansion, fixed punctuation, "
-                            "clear sentence boundaries, and no run-on sentences. "
-                            "TTS script must read naturally out loud."
+                            "You are performing a LIGHT COPY-EDIT pass, not a rewrite. "
+                            "Return JSON object with key 'items': "
+                            "[{source_id, title, hook, final_script, caption, hashtags}] only. "
+                            "Rules for final_script: preserve original wording/order/meaning as much as possible; "
+                            "only make minimal grammar, punctuation, sentence-boundary, and spoken-form expansions "
+                            "(e.g. abbreviations, times, currency). Do not heavily paraphrase, do not aggressively "
+                            "shorten, and keep length close to source text."
                         ),
                     }
                 ],
@@ -257,7 +261,7 @@ def _openai_enhance(posts: list[RankedPost]) -> dict[str, dict[str, Any]]:
 
 
 def enhance_posts(posts: list[RankedPost]) -> list[EnhancedContent]:
-    """Enhance ranked posts using OpenAI when available, then fallback rewrite logic."""
+    """Enhance ranked posts using OpenAI edits with strict drift guardrails and fallback."""
 
     ai_items = _openai_enhance(posts)
     output: list[EnhancedContent] = []
@@ -267,17 +271,27 @@ def enhance_posts(posts: list[RankedPost]) -> list[EnhancedContent]:
         if not ai_row:
             output.append(fallback)
             continue
-        caption_script, tts_script = _normalize_script_outputs(ai_row, fallback)
+
+        source_text = " ".join(_clean_lines(post.raw.text))
+        candidate_script = normalize_tts_text(_extract_candidate_final_script(ai_row))
+        accepted_ai_edit = not _is_too_far_from_source(source_text, candidate_script)
+        final_script = candidate_script if accepted_ai_edit else fallback.final_script
+        if not accepted_ai_edit:
+            logger.info(
+                "Rejected aggressive AI edit for %s; using deterministic normalization fallback.",
+                post.raw.source_id,
+            )
 
         output.append(
             EnhancedContent(
                 source_post=post,
                 title=str(ai_row.get("title", "")).strip() or fallback.title,
                 hook=str(ai_row.get("hook", "")).strip() or fallback.hook,
-                narration=str(ai_row.get("narration", "")).strip() or tts_script or fallback.narration,
+                narration=final_script,
                 caption=str(ai_row.get("caption", "")).strip() or fallback.caption,
-                rewritten_caption_script=caption_script,
-                rewritten_tts_script=normalize_tts_text(tts_script),
+                final_script=final_script,
+                rewritten_caption_script=final_script,
+                rewritten_tts_script=final_script,
                 hashtags=[
                     str(tag).strip()
                     for tag in ai_row.get("hashtags", [])
@@ -285,5 +299,12 @@ def enhance_posts(posts: list[RankedPost]) -> list[EnhancedContent]:
                 ]
                 or fallback.hashtags,
             )
+        )
+        logger.info(
+            "Enhancement stats for %s: source_len=%d final_len=%d ai_edit_accepted=%s",
+            post.raw.source_id,
+            len(source_text),
+            len(final_script),
+            accepted_ai_edit,
         )
     return output
