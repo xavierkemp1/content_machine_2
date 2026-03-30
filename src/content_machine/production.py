@@ -31,6 +31,9 @@ class CaptionRenderConfig:
 @dataclass(frozen=True)
 class ProductionRuntimeConfig:
     background_safety_buffer_seconds: float = 0.75
+    background_randomize: bool = True
+    allow_immediate_background_repeats: bool = False
+    background_rng_seed: int | None = None
     separate_caption_and_tts_rewrite: bool = True
     voice_profile: str = "en_GB-northern_english_male-medium"
     caption: CaptionRenderConfig = CaptionRenderConfig()
@@ -90,6 +93,17 @@ def _load_runtime_config() -> ProductionRuntimeConfig:
     except ValueError:
         safety_buffer = 0.75
     safety_buffer = max(0.0, min(2.0, safety_buffer))
+    randomize = os.getenv("BACKGROUND_RANDOMIZE", "1").strip().lower() in {"1", "true", "yes"}
+    allow_repeats = os.getenv("BACKGROUND_ALLOW_IMMEDIATE_REPEATS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    seed_text = os.getenv("BACKGROUND_RANDOM_SEED", "").strip()
+    try:
+        background_rng_seed = int(seed_text) if seed_text else None
+    except ValueError:
+        background_rng_seed = None
 
     separate_scripts = os.getenv("SEPARATE_CAPTION_TTS_REWRITE", "1").strip().lower() in {
         "1",
@@ -101,6 +115,9 @@ def _load_runtime_config() -> ProductionRuntimeConfig:
 
     return ProductionRuntimeConfig(
         background_safety_buffer_seconds=safety_buffer,
+        background_randomize=randomize,
+        allow_immediate_background_repeats=allow_repeats,
+        background_rng_seed=background_rng_seed,
         separate_caption_and_tts_rewrite=separate_scripts,
         voice_profile=voice_profile,
         caption=CaptionRenderConfig(
@@ -402,7 +419,9 @@ def build_background_timeline(
     background_dir: Path,
     target_duration: float,
     safety_buffer_seconds: float = 0.75,
-    rng_seed: int = 7,
+    rng_seed: int | None = None,
+    randomize: bool = True,
+    allow_immediate_repeats: bool = False,
 ) -> tuple[list[Path], float]:
     """Select clips until duration covers target+buffer, with reuse when needed."""
     supported_suffixes = {".mp4", ".mov", ".mkv", ".webm"}
@@ -434,18 +453,26 @@ def build_background_timeline(
         clip, duration = valid_clips[0]
         return [clip], duration
 
-    rng = random.Random(rng_seed)
+    rng = random.Random(rng_seed) if randomize else None
     desired_total = target_duration + max(0.0, safety_buffer_seconds)
     selected: list[Path] = []
     total_duration = 0.0
     previous: Path | None = None
+    deterministic_idx = 0
     attempts = 0
     max_attempts = max(40, len(valid_clips) * 20)
 
     while total_duration < desired_total and attempts < max_attempts:
         attempts += 1
-        candidates = [item for item in valid_clips if item[0] != previous] or valid_clips
-        clip, duration = rng.choice(candidates)
+        candidates = (
+            [item for item in valid_clips if allow_immediate_repeats or item[0] != previous]
+            or valid_clips
+        )
+        if randomize:
+            clip, duration = rng.choice(candidates)  # type: ignore[union-attr]
+        else:
+            clip, duration = candidates[deterministic_idx % len(candidates)]
+            deterministic_idx += 1
         selected.append(clip)
         total_duration += duration
         previous = clip
@@ -457,6 +484,13 @@ def build_background_timeline(
             attempts,
             total_duration,
         )
+    selected_summary = ", ".join(path.name for path in selected)
+    logger.info(
+        "Background clip order (%d clip(s), total %.2fs): %s",
+        len(selected),
+        total_duration,
+        selected_summary,
+    )
     return selected, total_duration
 
 
@@ -493,7 +527,7 @@ def _escape_subtitles_filter_path(path: str) -> str:
 def _compose_video(
     audio_path: str,
     subtitles_path: str,
-    background_manifest_path: str,
+    background_clips: list[Path],
     output_path: Path,
     audio_duration: float = 0.0,
     timeout: int = 300,
@@ -531,12 +565,8 @@ def _compose_video(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     escaped_subs = _escape_subtitles_filter_path(subtitles_path)
-    vf = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
-        f"subtitles='{escaped_subs}',"
-        "format=yuv420p"
-    )
+    if not background_clips:
+        raise RuntimeError("No background clips were selected for composition.")
 
     command = [
         ffmpeg_bin,
@@ -544,28 +574,52 @@ def _compose_video(
         "-loglevel",
         "error" if not verbose else "info",
         "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        background_manifest_path,
-        "-i",
-        audio_path,
-        "-vf",
-        vf,
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-shortest",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
     ]
+    for clip in background_clips:
+        command.extend(["-i", str(clip)])
+    command.extend(["-i", audio_path])
+
+    normalized_labels: list[str] = []
+    filter_parts: list[str] = []
+    for idx in range(len(background_clips)):
+        label = f"v{idx}"
+        normalized_labels.append(f"[{label}]")
+        filter_parts.append(
+            f"[{idx}:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+            f"crop=1080:1920,setsar=1[{label}]"
+        )
+    concat_label = "bg" if len(normalized_labels) > 1 else "v0"
+    if len(normalized_labels) > 1:
+        filter_parts.append(
+            "".join(normalized_labels) + f"concat=n={len(normalized_labels)}:v=1:a=0[{concat_label}]"
+        )
+    target_duration = max(0.01, audio_duration)
+    filter_parts.append(
+        f"[{concat_label}]trim=duration={target_duration:.3f},"
+        "setpts=PTS-STARTPTS,"
+        f"subtitles='{escaped_subs}',"
+        "format=yuv420p[vout]"
+    )
+    filter_complex = ";".join(filter_parts)
+
+    audio_input_idx = len(background_clips)
+    command.extend(
+        [
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[vout]",
+            "-map",
+            f"{audio_input_idx}:a:0",
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+        ]
+    )
 
     if audio_duration > 0:
         command += ["-t", f"{audio_duration:.3f}"]
@@ -673,6 +727,9 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
         background_dir=background_dir,
         target_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(tts_script),
         safety_buffer_seconds=runtime_cfg.background_safety_buffer_seconds,
+        rng_seed=runtime_cfg.background_rng_seed,
+        randomize=runtime_cfg.background_randomize,
+        allow_immediate_repeats=runtime_cfg.allow_immediate_background_repeats,
     )
     logger.info(
         "Background timeline assembled %.2fs for target %.2fs (buffer %.2fs).",
@@ -680,11 +737,6 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
         audio_duration if audio_duration > 0 else _estimate_duration_seconds(tts_script),
         runtime_cfg.background_safety_buffer_seconds,
     )
-    manifest_path = _write_concat_manifest(
-        selected_backgrounds,
-        root / "backgrounds" / f"{stem}.txt",
-    )
-
     verbose = os.getenv("FFMPEG_VERBOSE", "").strip().lower() in ("1", "true", "yes")
     try:
         timeout = int(os.getenv("FFMPEG_TIMEOUT", "300"))
@@ -694,7 +746,7 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
     video_path = _compose_video(
         audio_path=audio_path,
         subtitles_path=subtitles_path,
-        background_manifest_path=manifest_path,
+        background_clips=selected_backgrounds,
         output_path=root / "videos" / f"{stem}.mp4",
         audio_duration=audio_duration,
         timeout=timeout,

@@ -221,6 +221,30 @@ class TestPipelineStages(unittest.TestCase):
             self.assertGreaterEqual(assembled, 3.5)
             self.assertTrue(all(path.name == "only.mp4" for path in clips))
 
+    def test_background_builder_avoids_immediate_duplicates_when_possible(self):
+        from content_machine import production as prod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bg_dir = Path(tmpdir) / "background_clips"
+            bg_dir.mkdir(parents=True, exist_ok=True)
+            (bg_dir / "a.mp4").write_bytes(b"fake")
+            (bg_dir / "b.mp4").write_bytes(b"fake")
+            original_probe = prod._probe_media_duration_seconds
+            try:
+                prod._probe_media_duration_seconds = lambda _path: 1.0
+                clips, _assembled = prod.build_background_timeline(
+                    bg_dir,
+                    target_duration=4.0,
+                    safety_buffer_seconds=0.0,
+                    randomize=False,
+                    allow_immediate_repeats=False,
+                )
+            finally:
+                prod._probe_media_duration_seconds = original_probe
+
+            for previous, current in zip(clips, clips[1:]):
+                self.assertNotEqual(previous, current)
+
     def test_generate_ass_subtitles_plain_mode_disables_active_word_highlighting(self):
         from content_machine.production import CaptionRenderConfig, _generate_ass_subtitles
 
@@ -267,6 +291,15 @@ class TestPipelineStages(unittest.TestCase):
         self.assertNotEqual(enhanced.rewritten_caption_script, enhanced.rewritten_tts_script)
         self.assertTrue(enhanced.rewritten_caption_script)
         self.assertTrue(enhanced.rewritten_tts_script)
+
+    def test_normalize_tts_text_expands_common_abbreviations(self):
+        text = "AITA for saying idk at 3am after a £20k argument?"
+        normalized = improvement.normalize_tts_text(text)
+        self.assertIn("am i the asshole", normalized.lower())
+        self.assertIn("i don't know", normalized.lower())
+        self.assertIn("in the morning", normalized.lower())
+        self.assertIn("pounds", normalized.lower())
+        self.assertTrue(normalized.endswith(("?", ".", "!")))
 
     def test_write_concat_manifest_contains_clip_paths(self):
         from content_machine.production import _write_concat_manifest
