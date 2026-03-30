@@ -41,7 +41,15 @@ def run_pipeline() -> None:
             len(artifacts),
         )
 
-        exported = export_outputs(list(zip(enhanced, artifacts, strict=False)))
+        if len(enhanced) != len(artifacts):
+            raise RuntimeError(
+                f"Pipeline pairing mismatch: {len(enhanced)} enhanced item(s) produced "
+                f"but {len(artifacts)} production artifact(s) returned. "
+                "Cannot safely pair EnhancedContent with ProductionArtifact."
+            )
+        pairs: list[tuple] = list(zip(enhanced, artifacts))
+
+        exported = export_outputs(pairs)
         logger.info(
             "Stage 5 — export: %d item(s) written to output/ (organised by theme).",
             len(exported),

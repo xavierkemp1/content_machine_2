@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -661,6 +663,11 @@ def _compose_video(
     return str(output_path)
 
 
+def _short_hash(text: str) -> str:
+    """Return a short (12-char) hex SHA-256 of *text* for compact log identifiers."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
 def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> ProductionArtifact:
     """Create TTS, subtitles, and compose a 9:16 background video artifact.
 
@@ -670,9 +677,12 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
 
     Environment variables
     ---------------------
-    FFMPEG_TIMEOUT   Seconds before ffmpeg is killed (default: 300).
-    FFMPEG_VERBOSE   Set to ``1`` / ``true`` / ``yes`` to stream ffmpeg output
-                     to the console instead of capturing it silently.
+    FFMPEG_TIMEOUT    Seconds before ffmpeg is killed (default: 300).
+    FFMPEG_VERBOSE    Set to ``1`` / ``true`` / ``yes`` to stream ffmpeg output
+                      to the console instead of capturing it silently.
+    STRICT_TEXT_SYNC  Default ``1``.  When enabled, aborts if the exact string
+                      passed to TTS differs from the one passed to caption
+                      generation.  Set to ``0`` to log the mismatch and continue.
     """
 
     root = Path(work_dir)
@@ -683,7 +693,9 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
     if not final_script:
         raise RuntimeError(f"Cannot render {stem}: final_script is empty.")
 
-    audio_path = _generate_tts(final_script, root / "audio" / f"{stem}.wav")
+    # ── PART 3/4: capture exact runtime TTS input ──────────────────────────
+    exact_tts_input: str = final_script
+    audio_path = _generate_tts(exact_tts_input, root / "audio" / f"{stem}.wav")
 
     # Derive exact duration from the generated WAV for accurate subtitle sync
     audio_duration = _get_wav_duration(audio_path)
@@ -693,19 +705,37 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
             audio_path,
         )
 
+    # ── PART 3/4: capture exact runtime caption input ──────────────────────
+    exact_caption_input: str = final_script
     if runtime_cfg.caption.style_mode in {"active_word", "plain"}:
         subtitles_path = _generate_ass_subtitles(
-            caption_script=final_script,
+            caption_script=exact_caption_input,
             output_path=root / "subs" / f"{stem}.ass",
             audio_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(final_script),
             caption_cfg=runtime_cfg.caption,
         )
     else:
         subtitles_path = _generate_subtitles(
-            final_script,
+            exact_caption_input,
             root / "subs" / f"{stem}.srt",
             audio_duration=audio_duration if audio_duration > 0 else None,
         )
+
+    # ── PART 4: STRICT_TEXT_SYNC enforcement ───────────────────────────────
+    strict_sync = os.getenv("STRICT_TEXT_SYNC", "1").strip().lower() not in {"0", "false", "no"}
+    inputs_identical = exact_tts_input == exact_caption_input
+    if not inputs_identical:
+        tts_hash = _short_hash(exact_tts_input)
+        caption_hash = _short_hash(exact_caption_input)
+        msg = (
+            f"TEXT SYNC MISMATCH for {stem}: "
+            f"TTS input (hash={tts_hash}) != caption input (hash={caption_hash}). "
+            "These strings must be identical for spoken audio and visible captions to match."
+        )
+        if strict_sync:
+            raise RuntimeError(msg)
+        logger.error("STRICT_TEXT_SYNC=0 — continuing despite mismatch. %s", msg)
+
     background_dir = Path(os.getenv("BACKGROUND_CLIPS_DIR", "background_clips"))
     if not background_dir.is_absolute():
         background_dir = Path.cwd() / background_dir
@@ -748,6 +778,28 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
         output_duration,
     )
 
+    # ── PART 3: write debug JSON artifact ──────────────────────────────────
+    subtitle_actual_path = Path(subtitles_path)
+    subtitle_actual_format = subtitle_actual_path.suffix.lstrip(".").lower()
+    debug_payload: dict = {
+        "final_script": final_script,
+        "exact_tts_input_text": exact_tts_input,
+        "exact_caption_input_text": exact_caption_input,
+        "tts_input_hash": _short_hash(exact_tts_input),
+        "caption_input_hash": _short_hash(exact_caption_input),
+        "inputs_identical": inputs_identical,
+        "subtitle_file_actual_path": str(subtitle_actual_path),
+        "subtitle_file_actual_format": subtitle_actual_format,
+        "output_video_path": video_path,
+        "audio_path": audio_path,
+        "source_id": content.source_post.raw.source_id,
+    }
+    debug_dir = root / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_path = debug_dir / f"{stem}.debug.json"
+    debug_path.write_text(json.dumps(debug_payload, indent=2), encoding="utf-8")
+    logger.info("Debug artifact written to %s (inputs_identical=%s)", debug_path, inputs_identical)
+
     logger.info(
         "Production complete for %r. Build artifacts in %s; "
         "final exports expected in output/ organised by theme after export stage.",
@@ -758,7 +810,7 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
     return ProductionArtifact(
         video_path=video_path,
         subtitles_path=subtitles_path,
-        metadata_path="",
+        metadata_path=str(debug_path),
         audio_path=audio_path,
         background_path="|".join(str(path) for path in selected_backgrounds),
     )
