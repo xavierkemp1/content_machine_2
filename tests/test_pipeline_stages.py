@@ -183,17 +183,90 @@ class TestPipelineStages(unittest.TestCase):
                 (bg_dir / name).write_bytes(b"fake")
 
             original_probe = prod._probe_media_duration_seconds
-            original_choice = prod.random.choice
             try:
                 prod._probe_media_duration_seconds = lambda _path: 1.5
-                prod.random.choice = lambda seq: seq[0]
-                clips = prod._select_background_clips(bg_dir, target_duration=4.0)
+                clips, assembled = prod.build_background_timeline(
+                    bg_dir,
+                    target_duration=4.0,
+                    safety_buffer_seconds=0.5,
+                    rng_seed=1,
+                )
             finally:
                 prod._probe_media_duration_seconds = original_probe
-                prod.random.choice = original_choice
 
             self.assertGreaterEqual(len(clips), 3)
+            self.assertGreaterEqual(assembled, 4.5)
             self.assertTrue(all(path.suffix == ".mp4" for path in clips))
+
+    def test_background_builder_handles_single_clip_reuse(self):
+        from content_machine import production as prod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bg_dir = Path(tmpdir) / "background_clips"
+            bg_dir.mkdir(parents=True, exist_ok=True)
+            (bg_dir / "only.mp4").write_bytes(b"fake")
+            original_probe = prod._probe_media_duration_seconds
+            try:
+                prod._probe_media_duration_seconds = lambda _path: 1.0
+                clips, assembled = prod.build_background_timeline(
+                    bg_dir,
+                    target_duration=3.0,
+                    safety_buffer_seconds=0.5,
+                    rng_seed=1,
+                )
+            finally:
+                prod._probe_media_duration_seconds = original_probe
+
+            self.assertGreaterEqual(len(clips), 3)
+            self.assertGreaterEqual(assembled, 3.5)
+            self.assertTrue(all(path.name == "only.mp4" for path in clips))
+
+    def test_generate_ass_subtitles_plain_mode_disables_active_word_highlighting(self):
+        from content_machine.production import CaptionRenderConfig, _generate_ass_subtitles
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ass_path = Path(tmpdir) / "subs.ass"
+            _generate_ass_subtitles(
+                caption_script="This is a caption script for subtitle timing checks",
+                output_path=ass_path,
+                audio_duration=6.0,
+                caption_cfg=CaptionRenderConfig(style_mode="plain"),
+            )
+            body = ass_path.read_text(encoding="utf-8")
+            self.assertIn("Dialogue:", body)
+            self.assertNotIn("{\\c", body)
+
+    def test_improvement_enhance_posts_produces_split_scripts(self):
+        ranked = RankedPost(
+            raw=RawPost(
+                source="reddit",
+                source_id="xyz",
+                author="u",
+                text="AITA for charging my friend £20k after a long dispute?",
+                metrics={},
+            ),
+            length_bucket="short",
+            viral_score=70.0,
+        )
+        original_openai = improvement._openai_enhance
+        try:
+            improvement._openai_enhance = lambda _posts: {
+                "xyz": {
+                    "source_id": "xyz",
+                    "title": "Title",
+                    "hook": "Hook",
+                    "rewritten_caption_script": "Charged my friend. Too far?",
+                    "rewritten_tts_script": "I charged my friend twenty thousand pounds after months of fighting.",
+                    "hashtags": ["#storytime"],
+                }
+            }
+            enhanced = improvement.enhance_posts([ranked])[0]
+        finally:
+            improvement._openai_enhance = original_openai
+
+        self.assertNotEqual(enhanced.rewritten_caption_script, enhanced.rewritten_tts_script)
+        self.assertTrue(enhanced.rewritten_caption_script)
+        self.assertTrue(enhanced.rewritten_tts_script)
 
     def test_write_concat_manifest_contains_clip_paths(self):
         from content_machine.production import _write_concat_manifest
