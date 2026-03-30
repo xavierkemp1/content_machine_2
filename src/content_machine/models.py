@@ -35,6 +35,8 @@ class EnhancedContent:
     hook: str
     narration: str
     caption: str
+    rewritten_caption_script: str = ""
+    rewritten_tts_script: str = ""
     hashtags: list[str] = field(default_factory=list)
 
 

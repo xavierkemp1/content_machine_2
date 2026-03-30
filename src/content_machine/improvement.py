@@ -44,8 +44,38 @@ def _fallback_enhancement(post: RankedPost) -> EnhancedContent:
         hook=hook,
         narration=narration,
         caption=caption,
+        rewritten_caption_script=narration,
+        rewritten_tts_script=narration,
         hashtags=hashtags,
     )
+
+
+def _normalize_script_outputs(ai_row: dict[str, Any], fallback: EnhancedContent) -> tuple[str, str]:
+    """Return (caption_script, tts_script) with sensible fallback behaviour."""
+    caption_script = str(
+        ai_row.get("rewritten_caption_script")
+        or ai_row.get("caption_script")
+        or ai_row.get("caption")
+        or ""
+    ).strip()
+    tts_script = str(
+        ai_row.get("rewritten_tts_script")
+        or ai_row.get("tts_script")
+        or ai_row.get("narration")
+        or ""
+    ).strip()
+
+    if caption_script and not tts_script:
+        tts_script = caption_script
+    elif tts_script and not caption_script:
+        caption_script = tts_script
+
+    if not caption_script:
+        caption_script = fallback.rewritten_caption_script or fallback.narration
+    if not tts_script:
+        tts_script = fallback.rewritten_tts_script or fallback.narration
+
+    return caption_script, tts_script
 
 
 def _openai_enhance(posts: list[RankedPost]) -> dict[str, dict[str, Any]]:
@@ -75,7 +105,12 @@ def _openai_enhance(posts: list[RankedPost]) -> dict[str, dict[str, Any]]:
                         "type": "input_text",
                         "text": (
                             "Rewrite each item for short-form delivery. Return JSON object with key "
-                            "'items': [{source_id, title, hook, narration, caption, hashtags}] only."
+                            "'items': [{source_id, title, hook, rewritten_caption_script, "
+                            "rewritten_tts_script, narration, caption, hashtags}] only. "
+                            "Rules: rewritten_caption_script must be concise and punchy for on-screen "
+                            "captions. rewritten_tts_script must be optimized for natural narration "
+                            "with spoken-friendly wording, expanded abbreviations when useful, and "
+                            "pause-friendly punctuation."
                         ),
                     }
                 ],
@@ -125,23 +160,27 @@ def enhance_posts(posts: list[RankedPost]) -> list[EnhancedContent]:
     output: list[EnhancedContent] = []
     for post in posts:
         ai_row = ai_items.get(post.raw.source_id)
+        fallback = _fallback_enhancement(post)
         if not ai_row:
-            output.append(_fallback_enhancement(post))
+            output.append(fallback)
             continue
+        caption_script, tts_script = _normalize_script_outputs(ai_row, fallback)
 
         output.append(
             EnhancedContent(
                 source_post=post,
-                title=str(ai_row.get("title", "")).strip() or _fallback_enhancement(post).title,
-                hook=str(ai_row.get("hook", "")).strip() or _fallback_enhancement(post).hook,
-                narration=str(ai_row.get("narration", "")).strip() or _fallback_enhancement(post).narration,
-                caption=str(ai_row.get("caption", "")).strip() or _fallback_enhancement(post).caption,
+                title=str(ai_row.get("title", "")).strip() or fallback.title,
+                hook=str(ai_row.get("hook", "")).strip() or fallback.hook,
+                narration=str(ai_row.get("narration", "")).strip() or tts_script or fallback.narration,
+                caption=str(ai_row.get("caption", "")).strip() or fallback.caption,
+                rewritten_caption_script=caption_script,
+                rewritten_tts_script=tts_script,
                 hashtags=[
                     str(tag).strip()
                     for tag in ai_row.get("hashtags", [])
                     if str(tag).strip()
                 ]
-                or _fallback_enhancement(post).hashtags,
+                or fallback.hashtags,
             )
         )
     return output

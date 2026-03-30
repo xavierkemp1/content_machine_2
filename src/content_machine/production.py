@@ -6,13 +6,34 @@ import logging
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import subprocess
 import wave
+from dataclasses import dataclass
 
 from .models import EnhancedContent, ProductionArtifact
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CaptionRenderConfig:
+    style_mode: str = "active_word"
+    active_word_highlight_color: str = "&H0038FF&"
+    font_size: int = 62
+    margin_v: int = 210
+    words_per_chunk: int = 7
+    min_chunk_seconds: float = 0.9
+    hook_scale: float = 1.12
+
+
+@dataclass(frozen=True)
+class ProductionRuntimeConfig:
+    background_safety_buffer_seconds: float = 0.75
+    separate_caption_and_tts_rewrite: bool = True
+    voice_profile: str = "en_GB-northern_english_male-medium"
+    caption: CaptionRenderConfig = CaptionRenderConfig()
 
 
 def _slugify(value: str) -> str:
@@ -59,6 +80,36 @@ def _generate_tts_stub(narration: str, output_path: Path) -> str:
 _DEFAULT_PIPER_VOICE = "en_GB-northern_english_male-medium"
 
 
+def _load_runtime_config() -> ProductionRuntimeConfig:
+    """Load runtime options from environment with safe defaults."""
+    style_mode = os.getenv("CAPTION_STYLE_MODE", "active_word").strip().lower() or "active_word"
+    if style_mode not in {"active_word", "plain"}:
+        style_mode = "active_word"
+    try:
+        safety_buffer = float(os.getenv("BACKGROUND_SAFETY_BUFFER_SECONDS", "0.75"))
+    except ValueError:
+        safety_buffer = 0.75
+    safety_buffer = max(0.0, min(2.0, safety_buffer))
+
+    separate_scripts = os.getenv("SEPARATE_CAPTION_TTS_REWRITE", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    voice_profile = os.getenv("VOICE_PROFILE", _DEFAULT_PIPER_VOICE).strip() or _DEFAULT_PIPER_VOICE
+    highlight_color = os.getenv("CAPTION_ACTIVE_WORD_COLOR", "&H0038FF&").strip() or "&H0038FF&"
+
+    return ProductionRuntimeConfig(
+        background_safety_buffer_seconds=safety_buffer,
+        separate_caption_and_tts_rewrite=separate_scripts,
+        voice_profile=voice_profile,
+        caption=CaptionRenderConfig(
+            style_mode=style_mode,
+            active_word_highlight_color=highlight_color,
+        ),
+    )
+
+
 def _generate_tts(narration: str, output_path: Path) -> str:
     """Generate TTS audio via Piper when configured, otherwise fall back to the silent stub.
 
@@ -91,7 +142,11 @@ def _generate_tts(narration: str, output_path: Path) -> str:
         return _generate_tts_stub(narration, output_path)
 
     voices_dir = os.getenv("PIPER_VOICES_DIR", "").strip()
-    voice = os.getenv("PIPER_VOICE", _DEFAULT_PIPER_VOICE).strip() or _DEFAULT_PIPER_VOICE
+    voice = (
+        os.getenv("PIPER_VOICE", "").strip()
+        or os.getenv("VOICE_PROFILE", "").strip()
+        or _DEFAULT_PIPER_VOICE
+    )
     model_path = Path(voices_dir) / f"{voice}.onnx" if voices_dir else Path(f"{voice}.onnx")
 
     if not model_path.is_file():
@@ -195,6 +250,129 @@ def _generate_subtitles(narration: str, output_path: Path, audio_duration: float
     return str(output_path)
 
 
+def _chunk_words_for_captions(words: list[str], words_per_chunk: int) -> list[list[str]]:
+    if not words:
+        return [[]]
+    chunks: list[list[str]] = []
+    idx = 0
+    while idx < len(words):
+        end = min(len(words), idx + words_per_chunk)
+        chunks.append(words[idx:end])
+        idx = end
+    return chunks
+
+
+def _estimate_word_weights(chunk_words: list[str]) -> list[float]:
+    weights = []
+    for word in chunk_words:
+        clean = re.sub(r"[^a-zA-Z0-9]", "", word)
+        weights.append(max(1.0, float(len(clean) or 1)))
+    return weights
+
+
+def _seconds_to_ass_time(seconds: float) -> str:
+    total_cs = int(round(max(0.0, seconds) * 100))
+    hh = total_cs // 360000
+    mm = (total_cs % 360000) // 6000
+    ss = (total_cs % 6000) // 100
+    cs = total_cs % 100
+    return f"{hh}:{mm:02d}:{ss:02d}.{cs:02d}"
+
+
+def _ass_escape_text(value: str) -> str:
+    return value.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+
+
+def _build_ass_dialogue_lines(
+    caption_script: str,
+    audio_duration: float,
+    caption_cfg: CaptionRenderConfig,
+) -> list[str]:
+    words = caption_script.split()
+    chunks = _chunk_words_for_captions(words, words_per_chunk=max(2, caption_cfg.words_per_chunk))
+    total_chars = max(1, sum(len(" ".join(chunk)) for chunk in chunks if chunk))
+    lines: list[str] = []
+    elapsed = 0.0
+
+    for idx, chunk_words in enumerate(chunks):
+        chunk_text = " ".join(chunk_words).strip()
+        if not chunk_text:
+            continue
+        base_fraction = len(chunk_text) / total_chars
+        chunk_duration = max(caption_cfg.min_chunk_seconds, audio_duration * base_fraction)
+        if idx == len(chunks) - 1:
+            chunk_end = audio_duration
+        else:
+            chunk_end = min(audio_duration, elapsed + chunk_duration)
+        chunk_start = min(elapsed, audio_duration)
+        chunk_span = max(0.05, chunk_end - chunk_start)
+        word_weights = _estimate_word_weights(chunk_words)
+        total_weight = max(1.0, sum(word_weights))
+        word_elapsed = chunk_start
+        for word_idx, word in enumerate(chunk_words):
+            weight_fraction = word_weights[word_idx] / total_weight
+            word_end = chunk_end if word_idx == len(chunk_words) - 1 else min(chunk_end, word_elapsed + chunk_span * weight_fraction)
+            rendered_words: list[str] = []
+            for highlight_idx, token in enumerate(chunk_words):
+                escaped = _ass_escape_text(token)
+                if highlight_idx == word_idx and caption_cfg.style_mode == "active_word":
+                    rendered_words.append(
+                        "{\\c"
+                        + caption_cfg.active_word_highlight_color
+                        + "}"
+                        + escaped
+                        + "{\\c&HFFFFFF&}"
+                    )
+                else:
+                    rendered_words.append(escaped)
+            rendered_text = " ".join(rendered_words)
+            style = "Hook" if idx == 0 else "Default"
+            lines.append(
+                "Dialogue: 0,"
+                f"{_seconds_to_ass_time(word_elapsed)},{_seconds_to_ass_time(word_end)},"
+                f"{style},,0,0,0,,{rendered_text}"
+            )
+            word_elapsed = word_end
+        elapsed = chunk_end
+    return lines
+
+
+def _generate_ass_subtitles(
+    caption_script: str,
+    output_path: Path,
+    audio_duration: float,
+    caption_cfg: CaptionRenderConfig,
+) -> str:
+    dialogue_lines = _build_ass_dialogue_lines(caption_script, max(0.01, audio_duration), caption_cfg)
+    ass = "\n".join(
+        [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            "PlayResX: 1080",
+            "PlayResY: 1920",
+            "",
+            "[V4+ Styles]",
+            "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+            "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+            "Alignment,MarginL,MarginR,MarginV,Encoding",
+            f"Style: Default,Arial,{caption_cfg.font_size},&H00FFFFFF&,&H00FFFFFF&,&H00303030&,&H64000000&,"
+            "1,0,0,0,100,100,0,0,1,2.2,1.2,2,80,80,"
+            f"{caption_cfg.margin_v},1",
+            f"Style: Hook,Arial,{int(caption_cfg.font_size * caption_cfg.hook_scale)},&H00FFFFFF&,&H00FFFFFF&,&H00303030&,&H64000000&,"
+            "1,0,0,0,100,100,0,0,1,2.4,1.3,2,80,80,"
+            f"{caption_cfg.margin_v + 20},1",
+            "",
+            "[Events]",
+            "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
+            *dialogue_lines,
+            "",
+        ]
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(ass, encoding="utf-8")
+    return str(output_path)
+
+
 def _probe_media_duration_seconds(media_path: Path) -> float:
     """Read media duration using ffprobe; return 0.0 if unavailable."""
     ffprobe_bin = shutil.which("ffprobe")
@@ -220,8 +398,13 @@ def _probe_media_duration_seconds(media_path: Path) -> float:
         return 0.0
 
 
-def _select_background_clips(background_dir: Path, target_duration: float) -> list[Path]:
-    """Select random clips and repeat as needed until *target_duration* is covered."""
+def build_background_timeline(
+    background_dir: Path,
+    target_duration: float,
+    safety_buffer_seconds: float = 0.75,
+    rng_seed: int = 7,
+) -> tuple[list[Path], float]:
+    """Select clips until duration covers target+buffer, with reuse when needed."""
     supported_suffixes = {".mp4", ".mov", ".mkv", ".webm"}
     clips = sorted(
         path
@@ -234,36 +417,52 @@ def _select_background_clips(background_dir: Path, target_duration: float) -> li
             "Add .mp4 (or .mov/.mkv/.webm) clips to this folder."
         )
 
-    if target_duration <= 0:
-        return [random.choice(clips)]
-
-    selected: list[Path] = []
-    total = 0.0
-    attempts = 0
-    max_attempts = max(20, len(clips) * 10)
-    while total < target_duration:
-        attempts += 1
-        if attempts > max_attempts and not selected:
-            raise RuntimeError(
-                "Could not determine durations for background clips via ffprobe. "
-                "Ensure clips are valid media files and ffprobe is installed."
-            )
-        if attempts > max_attempts and selected:
-            logger.warning(
-                "Background selection ended early after %d attempts; accumulated %.2fs for target %.2fs.",
-                attempts,
-                total,
-                target_duration,
-            )
-            break
-        clip = random.choice(clips)
+    valid_clips: list[tuple[Path, float]] = []
+    for clip in clips:
         duration = _probe_media_duration_seconds(clip)
-        if duration <= 0:
-            logger.warning("Could not probe duration for background clip %s; skipping.", clip)
+        if duration <= 0.15:
+            logger.warning("Skipping background clip %s (duration unavailable or too short).", clip)
             continue
-        selected.append(clip)
-        total += duration
+        valid_clips.append((clip, duration))
+    if not valid_clips:
+        raise RuntimeError(
+            f"No valid background clips with measurable duration found in {background_dir}. "
+            "Ensure clips are readable and ffprobe is available."
+        )
 
+    if target_duration <= 0:
+        clip, duration = valid_clips[0]
+        return [clip], duration
+
+    rng = random.Random(rng_seed)
+    desired_total = target_duration + max(0.0, safety_buffer_seconds)
+    selected: list[Path] = []
+    total_duration = 0.0
+    previous: Path | None = None
+    attempts = 0
+    max_attempts = max(40, len(valid_clips) * 20)
+
+    while total_duration < desired_total and attempts < max_attempts:
+        attempts += 1
+        candidates = [item for item in valid_clips if item[0] != previous] or valid_clips
+        clip, duration = rng.choice(candidates)
+        selected.append(clip)
+        total_duration += duration
+        previous = clip
+
+    if total_duration < desired_total:
+        logger.warning(
+            "Background timeline did not reach desired %.2fs after %d attempts (reached %.2fs).",
+            desired_total,
+            attempts,
+            total_duration,
+        )
+    return selected, total_duration
+
+
+def _select_background_clips(background_dir: Path, target_duration: float) -> list[Path]:
+    """Backward-compatible wrapper around background timeline builder."""
+    selected, _ = build_background_timeline(background_dir, target_duration)
     return selected
 
 
@@ -432,7 +631,19 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
     root = Path(work_dir)
     stem = f"{content.source_post.raw.source}-{_slugify(content.source_post.raw.source_id)}"
 
-    audio_path = _generate_tts(content.narration, root / "audio" / f"{stem}.wav")
+    runtime_cfg = _load_runtime_config()
+    tts_script = (
+        content.rewritten_tts_script
+        if runtime_cfg.separate_caption_and_tts_rewrite and content.rewritten_tts_script
+        else content.narration
+    )
+    caption_script = (
+        content.rewritten_caption_script
+        if runtime_cfg.separate_caption_and_tts_rewrite and content.rewritten_caption_script
+        else content.narration
+    )
+
+    audio_path = _generate_tts(tts_script, root / "audio" / f"{stem}.wav")
 
     # Derive exact duration from the generated WAV for accurate subtitle sync
     audio_duration = _get_wav_duration(audio_path)
@@ -442,17 +653,32 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
             audio_path,
         )
 
-    subtitles_path = _generate_subtitles(
-        content.narration,
-        root / "subs" / f"{stem}.srt",
-        audio_duration=audio_duration if audio_duration > 0 else None,
-    )
+    if runtime_cfg.caption.style_mode in {"active_word", "plain"}:
+        subtitles_path = _generate_ass_subtitles(
+            caption_script=caption_script,
+            output_path=root / "subs" / f"{stem}.ass",
+            audio_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(tts_script),
+            caption_cfg=runtime_cfg.caption,
+        )
+    else:
+        subtitles_path = _generate_subtitles(
+            caption_script,
+            root / "subs" / f"{stem}.srt",
+            audio_duration=audio_duration if audio_duration > 0 else None,
+        )
     background_dir = Path(os.getenv("BACKGROUND_CLIPS_DIR", "background_clips"))
     if not background_dir.is_absolute():
         background_dir = Path.cwd() / background_dir
-    selected_backgrounds = _select_background_clips(
+    selected_backgrounds, assembled_duration = build_background_timeline(
         background_dir=background_dir,
-        target_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(content.narration),
+        target_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(tts_script),
+        safety_buffer_seconds=runtime_cfg.background_safety_buffer_seconds,
+    )
+    logger.info(
+        "Background timeline assembled %.2fs for target %.2fs (buffer %.2fs).",
+        assembled_duration,
+        audio_duration if audio_duration > 0 else _estimate_duration_seconds(tts_script),
+        runtime_cfg.background_safety_buffer_seconds,
     )
     manifest_path = _write_concat_manifest(
         selected_backgrounds,

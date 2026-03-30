@@ -36,6 +36,12 @@ OPENAI_RANKING_MODEL=gpt-4.1-mini
 OPENAI_REWRITE_MODEL=gpt-4.1-mini
 ```
 
+Rewrite output now supports dual-script fields:
+- `rewritten_caption_script` for on-screen caption pacing
+- `rewritten_tts_script` for natural narration delivery
+
+If only one script is returned by the model, the pipeline falls back safely.
+
 #### Piper TTS (optional)
 
 By default the pipeline generates a **silent WAV** as a placeholder for TTS audio.
@@ -56,6 +62,16 @@ PIPER_VOICE=en_GB-northern_english_male-medium
 ```
 
 If `PIPER_EXE` is unset or the file does not exist the pipeline falls back to the silent stub automatically (offline-safe).
+
+#### Production tuning (optional)
+
+```dotenv
+BACKGROUND_SAFETY_BUFFER_SECONDS=0.75
+CAPTION_STYLE_MODE=active_word   # or plain
+CAPTION_ACTIVE_WORD_COLOR=&H0038FF&
+SEPARATE_CAPTION_TTS_REWRITE=1
+VOICE_PROFILE=en_GB-northern_english_male-medium
+```
 
 Sources (Reddit subreddits, X accounts) and thresholds are configured in `config/sources.json`.
 
