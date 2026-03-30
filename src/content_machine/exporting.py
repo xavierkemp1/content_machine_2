@@ -36,7 +36,12 @@ def export_outputs(
 
         stem = f"{content.source_post.raw.source}-{_slugify(content.source_post.raw.source_id)}"
         video_dest = destination / f"{stem}.mp4"
-        subtitles_dest = destination / f"{stem}.srt"
+        # Preserve the actual subtitle extension produced by render (.ass or .srt).
+        source_subs_path = Path(artifact.subtitles_path) if artifact.subtitles_path else None
+        subtitle_ext = source_subs_path.suffix.lower() if source_subs_path else ".srt"
+        if subtitle_ext not in {".ass", ".srt"}:
+            subtitle_ext = ".srt"
+        subtitles_dest = destination / f"{stem}{subtitle_ext}"
         metadata_dest = destination / f"{stem}.json"
 
         source_video = Path(artifact.video_path)
@@ -57,10 +62,10 @@ def export_outputs(
             )
         shutil.copy2(source_video, video_dest)
 
-        source_subs = Path(artifact.subtitles_path)
-        if source_subs.exists():
-            shutil.copy2(source_subs, subtitles_dest)
+        if source_subs_path is not None and source_subs_path.exists():
+            shutil.copy2(source_subs_path, subtitles_dest)
 
+        subtitle_format = subtitle_ext.lstrip(".")  # "ass" or "srt"
         metadata = {
             "title": content.title,
             "hook": content.hook,
@@ -82,6 +87,7 @@ def export_outputs(
             "assets": {
                 "video_path": str(video_dest),
                 "subtitles_path": str(subtitles_dest),
+                "subtitles_format": subtitle_format,
                 "audio_path": artifact.audio_path,
                 "background_path": artifact.background_path,
             },
