@@ -330,6 +330,87 @@ class TestPipelineStages(unittest.TestCase):
         self.assertIn("pounds", normalized.lower())
         self.assertTrue(normalized.endswith(("?", ".", "!")))
 
+    def test_normalize_tts_text_expands_new_abbreviations(self):
+        """bc, tbh, ngl, atm, omg, smh are expanded to spoken form."""
+        from content_machine.improvement import normalize_tts_text
+        cases = [
+            ("bc idk", "because", "bc → because"),
+            ("tbh it was fine", "to be honest", "tbh → to be honest"),
+            ("ngl that was rough", "not going to lie", "ngl → not going to lie"),
+            ("atm i am busy", "at the moment", "atm → at the moment"),
+            ("omg i can't believe it", "oh my god", "omg → oh my god"),
+        ]
+        for text, expected_fragment, label in cases:
+            result = normalize_tts_text(text)
+            self.assertIn(expected_fragment, result.lower(), f"Failed: {label} — got: {result!r}")
+
+    def test_normalize_tts_text_drops_lol(self):
+        """'lol' is removed from spoken output as it sounds bad in TTS."""
+        from content_machine.improvement import normalize_tts_text
+        result = normalize_tts_text("I said lol just leave lol")
+        self.assertNotIn("lol", result.lower())
+        # Remaining content should still be present
+        self.assertIn("just leave", result.lower())
+
+    def test_repair_punctuation_capitalizes_first_word(self):
+        """_repair_punctuation ensures the first character of output is uppercase."""
+        from content_machine.improvement import _repair_punctuation
+        result = _repair_punctuation("my boyfriend left without saying a word")
+        self.assertTrue(result[0].isupper(), f"First char should be uppercase, got: {result!r}")
+
+    def test_repair_punctuation_capitalizes_after_sentence_end(self):
+        """After a sentence-ending . ! or ?, the next word starts with a capital letter."""
+        from content_machine.improvement import _repair_punctuation
+        result = _repair_punctuation("he left. she stayed. they argued")
+        # "she" and "they" should be capitalized after sentence ends
+        self.assertIn("She", result)
+        self.assertIn("They", result)
+
+    def test_normalize_numeric_text_handles_dollar_and_euro(self):
+        """$Nk and €Nk are expanded to 'N thousand dollars/euros'."""
+        from content_machine.improvement import _normalize_numeric_text
+        dollar = _normalize_numeric_text("I owe $15k")
+        euro = _normalize_numeric_text("costs €8k")
+        self.assertIn("thousand", dollar.lower())
+        self.assertIn("dollar", dollar.lower())
+        self.assertIn("thousand", euro.lower())
+        self.assertIn("euro", euro.lower())
+
+    def test_ai_edit_with_only_final_script_field_accepted(self):
+        """AI response containing only final_script (no legacy fields) is correctly accepted."""
+        from content_machine import improvement
+        ranked = RankedPost(
+            raw=RawPost(
+                source="reddit",
+                source_id="fs_only",
+                author="u",
+                text="I do not know what to do because my boyfriend left me at three in the morning.",
+                metrics={},
+            ),
+            length_bucket="short",
+            viral_score=60.0,
+        )
+        original_openai = improvement._openai_enhance
+        try:
+            improvement._openai_enhance = lambda _posts: {
+                "fs_only": {
+                    "source_id": "fs_only",
+                    "title": "T",
+                    "hook": "H",
+                    "final_script": "I do not know what to do, because my boyfriend left me at three in the morning.",
+                    "caption": "C",
+                    "hashtags": ["#storytime"],
+                }
+            }
+            enhanced = improvement.enhance_posts([ranked])[0]
+        finally:
+            improvement._openai_enhance = original_openai
+
+        # Must use the AI final_script (not fallback), and all three must be identical
+        self.assertIn("three in the morning", enhanced.final_script.lower())
+        self.assertEqual(enhanced.final_script, enhanced.rewritten_caption_script)
+        self.assertEqual(enhanced.final_script, enhanced.rewritten_tts_script)
+
     def test_render_video_uses_single_canonical_script(self):
         content = EnhancedContent(
             source_post=RankedPost(
