@@ -28,6 +28,21 @@ _ABBREVIATION_MAP = {
     "bf": "boyfriend",
     "gf": "girlfriend",
     "rn": "right now",
+    "bc": "because",
+    "tbh": "to be honest",
+    "lol": "",
+    "ngl": "not going to lie",
+    "smh": "shaking my head",
+    "atm": "at the moment",
+    "omg": "oh my god",
+    "omfg": "oh my god",
+    "irl": "in real life",
+    "fml": "forget my life",
+    "bff": "best friend",
+    "dw": "do not worry",
+    "nvm": "never mind",
+    "hmu": "hit me up",
+    "dm": "direct message",
 }
 
 
@@ -120,6 +135,18 @@ def _normalize_numeric_text(text: str) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(
+        r"\$\s*(\d+)\s*k\b",
+        lambda m: f"{m.group(1)} thousand dollars",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"€\s*(\d+)\s*k\b",
+        lambda m: f"{m.group(1)} thousand euros",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
         r"\b(\d{1,2})\s*(am|pm)\b",
         lambda m: f"{m.group(1)} {'in the morning' if m.group(2).lower() == 'am' else 'in the evening'}",
         text,
@@ -148,6 +175,9 @@ def _repair_punctuation(text: str) -> str:
     normalized = re.sub(r"\s+([,.;!?])", r"\1", normalized)
     normalized = re.sub(r"([.!?])([A-Za-z])", r"\1 \2", normalized)
     normalized = re.sub(r"\s{2,}", " ", normalized).strip()
+    normalized = re.sub(r"([.!?])\s+([a-z])", lambda m: m.group(1) + " " + m.group(2).upper(), normalized)
+    if normalized and normalized[0].islower():
+        normalized = normalized[0].upper() + normalized[1:]
     if normalized[-1] not in ".!?":
         normalized += "."
     return normalized
@@ -179,13 +209,25 @@ def _openai_enhance_batch(posts: list[RankedPost], model: str, api_key: str) -> 
                     {
                         "type": "input_text",
                         "text": (
-                            "You are performing a LIGHT COPY-EDIT pass, not a rewrite. "
-                            "Return JSON object with key 'items': "
-                            "[{source_id, title, hook, final_script, caption, hashtags}] only. "
-                            "Rules for final_script: preserve original wording/order/meaning as much as possible; "
-                            "only make minimal grammar, punctuation, sentence-boundary, and spoken-form expansions "
-                            "(e.g. abbreviations, times, currency). Do not heavily paraphrase, do not aggressively "
-                            "shorten, and keep length close to source text."
+                            "You are a LIGHT COPY-EDITOR for short-form speech scripts. You do NOT rewrite or paraphrase.\n\n"
+                            "For each item, produce EXACTLY ONE output field: final_script.\n\n"
+                            "Rules for final_script:\n"
+                            "1. Preserve the original wording, order, and meaning as closely as possible.\n"
+                            "2. Fix grammar, add missing punctuation, fix capitalization.\n"
+                            "3. Split run-on sentences at natural boundaries.\n"
+                            "4. Expand abbreviations that sound unnatural in speech:\n"
+                            "   - AITA → \"Am I the asshole\"\n"
+                            "   - WIBTA → \"Would I be wrong\"\n"
+                            "   - idk → \"I do not know\"\n"
+                            "   - bc → \"because\"\n"
+                            "   - bf/gf → \"boyfriend\"/\"girlfriend\"\n"
+                            "   - tbh → \"to be honest\"\n"
+                            "   - 3am → \"three in the morning\"\n"
+                            "   - £20k → \"twenty thousand pounds\"\n"
+                            "5. Do NOT heavily paraphrase, do NOT aggressively shorten, keep length close to source.\n"
+                            "6. Do NOT add dramatic flair, do NOT make it \"more viral\".\n"
+                            "7. Output must be a complete sentence or sequence of sentences ending with punctuation.\n\n"
+                            "Return JSON: {\"items\": [{\"source_id\": \"...\", \"title\": \"...\", \"hook\": \"...\", \"final_script\": \"...\", \"caption\": \"...\", \"hashtags\": [...]}]}"
                         ),
                     }
                 ],
@@ -301,10 +343,16 @@ def enhance_posts(posts: list[RankedPost]) -> list[EnhancedContent]:
             )
         )
         logger.info(
-            "Enhancement stats for %s: source_len=%d final_len=%d ai_edit_accepted=%s",
+            "Enhancement stats for %s: source_len=%d final_len=%d ai_edit_accepted=%s source_preview=%r",
             post.raw.source_id,
             len(source_text),
             len(final_script),
             accepted_ai_edit,
+            source_text[:80],
+        )
+        logger.info(
+            "final_script preview for %s: %r",
+            post.raw.source_id,
+            final_script[:120],
         )
     return output
