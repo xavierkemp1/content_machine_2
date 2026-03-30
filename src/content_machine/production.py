@@ -34,7 +34,6 @@ class ProductionRuntimeConfig:
     background_randomize: bool = True
     allow_immediate_background_repeats: bool = False
     background_rng_seed: int | None = None
-    separate_caption_and_tts_rewrite: bool = True
     voice_profile: str = "en_GB-northern_english_male-medium"
     caption: CaptionRenderConfig = CaptionRenderConfig()
 
@@ -105,11 +104,6 @@ def _load_runtime_config() -> ProductionRuntimeConfig:
     except ValueError:
         background_rng_seed = None
 
-    separate_scripts = os.getenv("SEPARATE_CAPTION_TTS_REWRITE", "1").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
     voice_profile = os.getenv("VOICE_PROFILE", _DEFAULT_PIPER_VOICE).strip() or _DEFAULT_PIPER_VOICE
     highlight_color = os.getenv("CAPTION_ACTIVE_WORD_COLOR", "&H0038FF&").strip() or "&H0038FF&"
 
@@ -118,7 +112,6 @@ def _load_runtime_config() -> ProductionRuntimeConfig:
         background_randomize=randomize,
         allow_immediate_background_repeats=allow_repeats,
         background_rng_seed=background_rng_seed,
-        separate_caption_and_tts_rewrite=separate_scripts,
         voice_profile=voice_profile,
         caption=CaptionRenderConfig(
             style_mode=style_mode,
@@ -686,18 +679,11 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
     stem = f"{content.source_post.raw.source}-{_slugify(content.source_post.raw.source_id)}"
 
     runtime_cfg = _load_runtime_config()
-    tts_script = (
-        content.rewritten_tts_script
-        if runtime_cfg.separate_caption_and_tts_rewrite and content.rewritten_tts_script
-        else content.narration
-    )
-    caption_script = (
-        content.rewritten_caption_script
-        if runtime_cfg.separate_caption_and_tts_rewrite and content.rewritten_caption_script
-        else content.narration
-    )
+    final_script = (content.final_script or content.narration or "").strip()
+    if not final_script:
+        raise RuntimeError(f"Cannot render {stem}: final_script is empty.")
 
-    audio_path = _generate_tts(tts_script, root / "audio" / f"{stem}.wav")
+    audio_path = _generate_tts(final_script, root / "audio" / f"{stem}.wav")
 
     # Derive exact duration from the generated WAV for accurate subtitle sync
     audio_duration = _get_wav_duration(audio_path)
@@ -709,14 +695,14 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
 
     if runtime_cfg.caption.style_mode in {"active_word", "plain"}:
         subtitles_path = _generate_ass_subtitles(
-            caption_script=caption_script,
+            caption_script=final_script,
             output_path=root / "subs" / f"{stem}.ass",
-            audio_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(tts_script),
+            audio_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(final_script),
             caption_cfg=runtime_cfg.caption,
         )
     else:
         subtitles_path = _generate_subtitles(
-            caption_script,
+            final_script,
             root / "subs" / f"{stem}.srt",
             audio_duration=audio_duration if audio_duration > 0 else None,
         )
@@ -725,7 +711,7 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
         background_dir = Path.cwd() / background_dir
     selected_backgrounds, assembled_duration = build_background_timeline(
         background_dir=background_dir,
-        target_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(tts_script),
+        target_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(final_script),
         safety_buffer_seconds=runtime_cfg.background_safety_buffer_seconds,
         rng_seed=runtime_cfg.background_rng_seed,
         randomize=runtime_cfg.background_randomize,
@@ -734,7 +720,7 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
     logger.info(
         "Background timeline assembled %.2fs for target %.2fs (buffer %.2fs).",
         assembled_duration,
-        audio_duration if audio_duration > 0 else _estimate_duration_seconds(tts_script),
+        audio_duration if audio_duration > 0 else _estimate_duration_seconds(final_script),
         runtime_cfg.background_safety_buffer_seconds,
     )
     verbose = os.getenv("FFMPEG_VERBOSE", "").strip().lower() in ("1", "true", "yes")
@@ -751,6 +737,15 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
         audio_duration=audio_duration,
         timeout=timeout,
         verbose=verbose,
+    )
+    output_duration = _probe_media_duration_seconds(Path(video_path))
+    logger.info(
+        "Render stats for %s: final_script_len=%d audio_duration=%.2fs background_duration=%.2fs output_duration=%.2fs",
+        stem,
+        len(final_script),
+        audio_duration,
+        assembled_duration,
+        output_duration,
     )
 
     logger.info(

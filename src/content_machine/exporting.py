@@ -66,8 +66,9 @@ def export_outputs(
             "hook": content.hook,
             "narration": content.narration,
             "caption": content.caption,
-            "rewritten_caption_script": content.rewritten_caption_script,
-            "rewritten_tts_script": content.rewritten_tts_script,
+            "final_script": content.final_script or content.narration,
+            "rewritten_caption_script": content.final_script or content.rewritten_caption_script,
+            "rewritten_tts_script": content.final_script or content.rewritten_tts_script,
             "hashtags": content.hashtags,
             "source": {
                 "platform": content.source_post.raw.source,

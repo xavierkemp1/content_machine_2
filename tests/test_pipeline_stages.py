@@ -260,7 +260,7 @@ class TestPipelineStages(unittest.TestCase):
             self.assertIn("Dialogue:", body)
             self.assertNotIn("{\\c", body)
 
-    def test_improvement_enhance_posts_produces_split_scripts(self):
+    def test_improvement_enhance_posts_uses_single_final_script(self):
         ranked = RankedPost(
             raw=RawPost(
                 source="reddit",
@@ -279,8 +279,7 @@ class TestPipelineStages(unittest.TestCase):
                     "source_id": "xyz",
                     "title": "Title",
                     "hook": "Hook",
-                    "rewritten_caption_script": "Charged my friend. Too far?",
-                    "rewritten_tts_script": "I charged my friend twenty thousand pounds after months of fighting.",
+                    "final_script": "Am I the asshole for charging my friend twenty thousand pounds after a long dispute?",
                     "hashtags": ["#storytime"],
                 }
             }
@@ -288,9 +287,39 @@ class TestPipelineStages(unittest.TestCase):
         finally:
             improvement._openai_enhance = original_openai
 
-        self.assertNotEqual(enhanced.rewritten_caption_script, enhanced.rewritten_tts_script)
-        self.assertTrue(enhanced.rewritten_caption_script)
-        self.assertTrue(enhanced.rewritten_tts_script)
+        self.assertEqual(enhanced.final_script, enhanced.rewritten_caption_script)
+        self.assertEqual(enhanced.final_script, enhanced.rewritten_tts_script)
+        self.assertTrue(enhanced.final_script)
+
+    def test_improvement_rejects_over_short_ai_rewrite(self):
+        ranked = RankedPost(
+            raw=RawPost(
+                source="reddit",
+                source_id="shrink",
+                author="u",
+                text="AITA for leaving at 3am bc idk what else to do after our argument went on for hours?",
+                metrics={},
+            ),
+            length_bucket="short",
+            viral_score=70.0,
+        )
+        original_openai = improvement._openai_enhance
+        try:
+            improvement._openai_enhance = lambda _posts: {
+                "shrink": {
+                    "source_id": "shrink",
+                    "title": "Title",
+                    "hook": "Hook",
+                    "final_script": "I left.",
+                    "hashtags": ["#storytime"],
+                }
+            }
+            enhanced = improvement.enhance_posts([ranked])[0]
+        finally:
+            improvement._openai_enhance = original_openai
+
+        self.assertNotEqual(enhanced.final_script, "I left.")
+        self.assertIn("am i the asshole", enhanced.final_script.lower())
 
     def test_normalize_tts_text_expands_common_abbreviations(self):
         text = "AITA for saying idk at 3am after a £20k argument?"
@@ -300,6 +329,62 @@ class TestPipelineStages(unittest.TestCase):
         self.assertIn("in the morning", normalized.lower())
         self.assertIn("pounds", normalized.lower())
         self.assertTrue(normalized.endswith(("?", ".", "!")))
+
+    def test_render_video_uses_single_canonical_script(self):
+        content = EnhancedContent(
+            source_post=RankedPost(
+                raw=RawPost(source="x", source_id="canon", author="a", text="Story text", metrics={}),
+                length_bucket="short",
+                viral_score=70.0,
+            ),
+            title="Title",
+            hook="Hook",
+            narration="Narration should not be used.",
+            caption="Caption",
+            final_script="Canonical script for tts and captions.",
+            rewritten_caption_script="Different caption script",
+            rewritten_tts_script="Different tts script",
+            hashtags=["#test"],
+        )
+
+        from content_machine import production as prod
+
+        captured = {}
+        original_generate_tts = prod._generate_tts
+        original_generate_ass = prod._generate_ass_subtitles
+        original_build_bg = prod.build_background_timeline
+        original_compose = prod._compose_video
+        original_wav_duration = prod._get_wav_duration
+        original_probe_duration = prod._probe_media_duration_seconds
+        try:
+            def _fake_generate_tts(narration, output_path):
+                captured["tts_script"] = narration
+                return str(output_path)
+
+            def _fake_generate_ass_subtitles(caption_script, output_path, audio_duration, caption_cfg):
+                captured["caption_script"] = caption_script
+                return str(output_path)
+
+            prod._generate_tts = _fake_generate_tts
+            prod._generate_ass_subtitles = _fake_generate_ass_subtitles
+            prod.build_background_timeline = lambda **kwargs: ([Path(__file__)], 5.0)
+            prod._compose_video = lambda **kwargs: kwargs["audio_path"].replace(".wav", ".mp4")
+            prod._get_wav_duration = lambda _path: 5.0
+            prod._probe_media_duration_seconds = lambda _path: 5.0
+            with tempfile.TemporaryDirectory() as tmpdir:
+                Path(tmpdir, "audio").mkdir(parents=True, exist_ok=True)
+                Path(tmpdir, "subs").mkdir(parents=True, exist_ok=True)
+                prod.render_video(content, work_dir=tmpdir)
+        finally:
+            prod._generate_tts = original_generate_tts
+            prod._generate_ass_subtitles = original_generate_ass
+            prod.build_background_timeline = original_build_bg
+            prod._compose_video = original_compose
+            prod._get_wav_duration = original_wav_duration
+            prod._probe_media_duration_seconds = original_probe_duration
+
+        self.assertEqual(content.final_script, captured["tts_script"])
+        self.assertEqual(content.final_script, captured["caption_script"])
 
     def test_write_concat_manifest_contains_clip_paths(self):
         from content_machine.production import _write_concat_manifest
