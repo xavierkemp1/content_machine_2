@@ -25,7 +25,7 @@ class CaptionRenderConfig:
     active_word_highlight_color: str = "&H0038FF&"
     font_size: int = 62
     margin_v: int = 210
-    words_per_chunk: int = 7
+    words_per_chunk: int = 4
     min_chunk_seconds: float = 0.9
     hook_scale: float = 1.12
 
@@ -109,6 +109,11 @@ def _load_runtime_config() -> ProductionRuntimeConfig:
     voice_profile = os.getenv("VOICE_PROFILE", _DEFAULT_PIPER_VOICE).strip() or _DEFAULT_PIPER_VOICE
     highlight_color = os.getenv("CAPTION_ACTIVE_WORD_COLOR", "&H0038FF&").strip() or "&H0038FF&"
 
+    _jitter_rng = random.Random()  # unseeded = different each run
+    font_size_jitter = _jitter_rng.randint(-3, 3)
+    margin_v_jitter = _jitter_rng.randint(-8, 8)
+    logger.debug("Caption jitter: font_size_jitter=%d margin_v_jitter=%d", font_size_jitter, margin_v_jitter)
+
     return ProductionRuntimeConfig(
         background_safety_buffer_seconds=safety_buffer,
         background_randomize=randomize,
@@ -118,6 +123,8 @@ def _load_runtime_config() -> ProductionRuntimeConfig:
         caption=CaptionRenderConfig(
             style_mode=style_mode,
             active_word_highlight_color=highlight_color,
+            font_size=62 + font_size_jitter,
+            margin_v=210 + margin_v_jitter,
         ),
     )
 
@@ -225,6 +232,35 @@ def _generate_tts(narration: str, output_path: Path) -> str:
     return str(output_path)
 
 
+def _trim_audio_silence(input_path: Path, output_path: Path) -> Path:
+    """Use ffmpeg silenceremove to strip leading/trailing and inter-sentence silence."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return input_path
+    if os.getenv("TRIM_SILENCE", "1").strip().lower() not in {"1", "true", "yes"}:
+        return input_path
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(input_path),
+                "-af",
+                # stop_periods=-1: remove all silence segments (not just leading/trailing)
+                # stop_duration=0.3: minimum silence duration (seconds) to remove
+                # stop_threshold=-40dB: audio below -40 dB is considered silence
+                "silenceremove=stop_periods=-1:stop_duration=0.3:stop_threshold=-40dB",
+                str(output_path),
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            logger.info("Silence trimmed: %s -> %s", input_path.name, output_path.name)
+            return output_path
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Silence trim failed (%s); using original audio.", exc)
+    return input_path
+
+
 def _generate_subtitles(narration: str, output_path: Path, audio_duration: float | None = None) -> str:
     """Write an SRT subtitle file whose timings fit exactly within *audio_duration*.
 
@@ -260,6 +296,42 @@ def _generate_subtitles(narration: str, output_path: Path, audio_duration: float
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
     return str(output_path)
+
+
+_NATURAL_BREAK_CONJUNCTIONS = {"and", "but", "so", "or", "because", "that", "when", "if"}
+
+
+def _smart_chunk_words(words: list[str], target_size: int) -> list[list[str]]:
+    """Split words into chunks aligned with natural speech pauses.
+
+    A chunk boundary is inserted when:
+    - the current chunk has reached *target_size* words, OR
+    - the current chunk has at least 2 words AND the next word is a natural
+      break conjunction (``and``, ``but``, ``so``, etc.) that follows a
+      comma-terminated word.
+    All input words are preserved; none are dropped.
+    """
+    if not words:
+        return []
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for word in words:
+        if current and len(current) >= target_size:
+            chunks.append(current)
+            current = [word]
+            continue
+        if (
+            len(current) >= 2
+            and word.lower().rstrip(",.!?") in _NATURAL_BREAK_CONJUNCTIONS
+            and current[-1].endswith(",")
+        ):
+            chunks.append(current)
+            current = [word]
+            continue
+        current.append(word)
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _chunk_words_for_captions(words: list[str], words_per_chunk: int) -> list[list[str]]:
@@ -301,7 +373,7 @@ def _build_ass_dialogue_lines(
     caption_cfg: CaptionRenderConfig,
 ) -> list[str]:
     words = caption_script.split()
-    chunks = _chunk_words_for_captions(words, words_per_chunk=max(2, caption_cfg.words_per_chunk))
+    chunks = _smart_chunk_words(words, target_size=max(2, caption_cfg.words_per_chunk))
     total_chars = max(1, sum(len(" ".join(chunk)) for chunk in chunks if chunk))
     lines: list[str] = []
     elapsed = 0.0
@@ -338,7 +410,7 @@ def _build_ass_dialogue_lines(
                 else:
                     rendered_words.append(escaped)
             rendered_text = " ".join(rendered_words)
-            style = "Hook" if idx == 0 else "Default"
+            style = "Hook" if idx <= 1 else "Default"
             lines.append(
                 "Dialogue: 0,"
                 f"{_seconds_to_ass_time(word_elapsed)},{_seconds_to_ass_time(word_end)},"
@@ -371,8 +443,8 @@ def _generate_ass_subtitles(
             "1,0,0,0,100,100,0,0,1,2.2,1.2,2,80,80,"
             f"{caption_cfg.margin_v},1",
             f"Style: Hook,Arial,{int(caption_cfg.font_size * caption_cfg.hook_scale)},&H00FFFFFF&,&H00FFFFFF&,&H00303030&,&H64000000&,"
-            "1,0,0,0,100,100,0,0,1,2.4,1.3,2,80,80,"
-            f"{caption_cfg.margin_v + 20},1",
+            "1,0,0,0,100,100,0,0,1,2.4,1.3,5,80,80,"
+            "0,1",
             "",
             "[Events]",
             "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
@@ -695,7 +767,11 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
 
     # ── PART 3/4: capture exact runtime TTS input ──────────────────────────
     exact_tts_input: str = final_script
-    audio_path = _generate_tts(exact_tts_input, root / "audio" / f"{stem}.wav")
+    raw_audio_path = _generate_tts(exact_tts_input, root / "audio" / f"{stem}.wav")
+    trimmed_audio_path = _trim_audio_silence(
+        Path(raw_audio_path), root / "audio" / f"{stem}.trimmed.wav"
+    )
+    audio_path = str(trimmed_audio_path)
 
     # Derive exact duration from the generated WAV for accurate subtitle sync
     audio_duration = _get_wav_duration(audio_path)
