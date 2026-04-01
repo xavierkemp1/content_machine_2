@@ -81,9 +81,6 @@ def _generate_tts_stub(narration: str, output_path: Path) -> str:
     return str(output_path)
 
 
-_DEFAULT_PIPER_VOICE = "en_GB-northern_english_male-medium"
-
-
 def _load_runtime_config() -> ProductionRuntimeConfig:
     """Load runtime options from environment with safe defaults."""
     style_mode = os.getenv("CAPTION_STYLE_MODE", "active_word").strip().lower() or "active_word"
@@ -106,7 +103,8 @@ def _load_runtime_config() -> ProductionRuntimeConfig:
     except ValueError:
         background_rng_seed = None
 
-    voice_profile = os.getenv("VOICE_PROFILE", _DEFAULT_PIPER_VOICE).strip() or _DEFAULT_PIPER_VOICE
+    _default_voice = ""
+    voice_profile = os.getenv("VOICE_PROFILE", _default_voice).strip()
     highlight_color = os.getenv("CAPTION_ACTIVE_WORD_COLOR", "&H0038FF&").strip() or "&H0038FF&"
 
     _jitter_rng = random.Random()  # unseeded = different each run
@@ -130,115 +128,57 @@ def _load_runtime_config() -> ProductionRuntimeConfig:
 
 
 def _generate_tts(narration: str, output_path: Path) -> str:
-    """Generate TTS audio via Piper when configured, otherwise fall back to the silent stub.
+    """Generate TTS audio via ElevenLabs when configured, otherwise fall back to the silent stub.
 
     Environment variables
     ---------------------
-    PIPER_EXE        Path to the piper executable.  When unset or the file is
-                     absent the silent stub is used instead (offline-safe).
-    PIPER_VOICES_DIR Directory that contains the ``.onnx`` voice model files.
-    PIPER_VOICE      Voice basename without extension
-                     (default: ``en_GB-northern_english_male-medium``).
+    ELEVENLABS_API_KEY   ElevenLabs API key.
+    ELEVENLABS_VOICE_ID  Voice ID to use for synthesis.
+    ELEVENLABS_MODEL_ID  Model to use (default: eleven_multilingual_v2).
+
+    When either key is absent the silent WAV stub is used (offline-safe).
+    The output will be MP3 when ElevenLabs is used; WAV for the stub.
     """
-    piper_exe = os.getenv("PIPER_EXE", "").strip()
-    if not piper_exe:
+    from .elevenlabs_client import ElevenLabsClient  # local import to keep module load light
+
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+
+    if not api_key or not voice_id:
         logger.info(
-            "PIPER_EXE is not set — using silent TTS stub. "
-            "To enable real voice synthesis set PIPER_EXE to the full path of "
-            "the piper executable in your .env file "
-            "(e.g. PIPER_EXE=C:\\Users\\xavie\\OneDrive\\Documents\\piper\\piper.exe)."
+            "ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID is not set — using silent TTS stub. "
+            "To enable real voice synthesis set both variables in your .env file."
         )
-        return _generate_tts_stub(narration, output_path)
+        stub_path = output_path.with_suffix(".wav")
+        return _generate_tts_stub(narration, stub_path)
 
-    if not Path(piper_exe).is_file():
-        logger.warning(
-            "PIPER_EXE is set to %r but no file was found at that path. "
-            "Check that you have pointed to the piper executable itself "
-            "(e.g. piper.exe), not just its containing folder. "
-            "Falling back to silent TTS stub.",
-            piper_exe,
-        )
-        return _generate_tts_stub(narration, output_path)
-
-    voices_dir = os.getenv("PIPER_VOICES_DIR", "").strip()
-    voice = (
-        os.getenv("PIPER_VOICE", "").strip()
-        or os.getenv("VOICE_PROFILE", "").strip()
-        or _DEFAULT_PIPER_VOICE
-    )
-    model_path = Path(voices_dir) / f"{voice}.onnx" if voices_dir else Path(f"{voice}.onnx")
-
-    if not model_path.is_file():
-        logger.warning(
-            "Piper voice model not found at %r. "
-            "Ensure PIPER_VOICES_DIR points to the folder containing *.onnx voice files "
-            "(e.g. PIPER_VOICES_DIR=C:\\Users\\xavie\\OneDrive\\Documents\\piper\\voices) "
-            "and that PIPER_VOICE matches a file in that folder without the .onnx extension "
-            "(current voice: %r). Falling back to silent TTS stub.",
-            str(model_path),
-            voice,
-        )
-        return _generate_tts_stub(narration, output_path)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    command = [
-        piper_exe,
-        "--model",
-        str(model_path),
-        "--output_file",
-        str(output_path),
-    ]
-
+    model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip() or "eleven_multilingual_v2"
+    mp3_path = output_path.with_suffix(".mp3")
+    client = ElevenLabsClient(api_key=api_key, voice_id=voice_id, model_id=model_id)
     try:
-        result = subprocess.run(
-            command,
-            input=narration,
-            text=True,
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            stderr_excerpt = result.stderr[-500:] if result.stderr else "(no stderr)"
-            logger.warning(
-                "Piper exited with code %d while generating %r.\n"
-                "  command:  %s\n"
-                "  stderr:   %s\n"
-                "Falling back to silent TTS stub.",
-                result.returncode,
-                str(output_path),
-                " ".join(command),
-                stderr_excerpt,
-            )
-            return _generate_tts_stub(narration, output_path)
-    except Exception as exc:  # noqa: BLE001
+        return client.generate_speech(narration, str(mp3_path))
+    except RuntimeError as exc:
         logger.warning(
-            "Piper TTS failed with exception %r while running %r — "
-            "falling back to silent TTS stub.",
-            str(exc),
-            " ".join(command),
+            "ElevenLabs TTS failed (%s) — falling back to silent TTS stub.",
+            exc,
         )
-        return _generate_tts_stub(narration, output_path)
-
-    if not output_path.exists() or output_path.stat().st_size == 0:
-        logger.warning(
-            "Piper ran successfully (exit 0) but produced no output at %r. "
-            "The voice model may be incompatible with the installed Piper version. "
-            "Falling back to silent TTS stub.",
-            str(output_path),
-        )
-        return _generate_tts_stub(narration, output_path)
-
-    logger.info("Piper TTS generated %r using voice %r.", str(output_path), voice)
-    return str(output_path)
+        stub_path = output_path.with_suffix(".wav")
+        return _generate_tts_stub(narration, stub_path)
 
 
 def _trim_audio_silence(input_path: Path, output_path: Path) -> Path:
-    """Use ffmpeg silenceremove to strip leading/trailing and inter-sentence silence."""
+    """Use ffmpeg silenceremove to strip leading/trailing and inter-sentence silence.
+
+    The *output_path* suffix is replaced with the *input_path* suffix so that
+    MP3 → MP3 and WAV → WAV trimming both work correctly.
+    """
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         return input_path
     if os.getenv("TRIM_SILENCE", "1").strip().lower() not in {"1", "true", "yes"}:
         return input_path
+    # Preserve the input format (e.g. .mp3 or .wav) in the output path
+    trimmed_path = output_path.with_suffix(input_path.suffix)
     try:
         result = subprocess.run(
             [
@@ -249,13 +189,13 @@ def _trim_audio_silence(input_path: Path, output_path: Path) -> Path:
                 # stop_duration=0.3: minimum silence duration (seconds) to remove
                 # stop_threshold=-40dB: audio below -40 dB is considered silence
                 "silenceremove=stop_periods=-1:stop_duration=0.3:stop_threshold=-40dB",
-                str(output_path),
+                str(trimmed_path),
             ],
             capture_output=True, text=True, timeout=60,
         )
-        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
-            logger.info("Silence trimmed: %s -> %s", input_path.name, output_path.name)
-            return output_path
+        if result.returncode == 0 and trimmed_path.exists() and trimmed_path.stat().st_size > 0:
+            logger.info("Silence trimmed: %s -> %s", input_path.name, trimmed_path.name)
+            return trimmed_path
     except Exception as exc:  # noqa: BLE001
         logger.warning("Silence trim failed (%s); using original audio.", exc)
     return input_path
@@ -428,30 +368,95 @@ def _generate_ass_subtitles(
     caption_cfg: CaptionRenderConfig,
 ) -> str:
     dialogue_lines = _build_ass_dialogue_lines(caption_script, max(0.01, audio_duration), caption_cfg)
-    ass = "\n".join(
-        [
-            "[Script Info]",
-            "ScriptType: v4.00+",
-            "PlayResX: 1080",
-            "PlayResY: 1920",
-            "",
-            "[V4+ Styles]",
-            "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
-            "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
-            "Alignment,MarginL,MarginR,MarginV,Encoding",
-            f"Style: Default,Arial,{caption_cfg.font_size},&H00FFFFFF&,&H00FFFFFF&,&H00303030&,&H64000000&,"
-            "1,0,0,0,100,100,0,0,1,2.2,1.2,2,80,80,"
-            f"{caption_cfg.margin_v},1",
-            f"Style: Hook,Arial,{int(caption_cfg.font_size * caption_cfg.hook_scale)},&H00FFFFFF&,&H00FFFFFF&,&H00303030&,&H64000000&,"
-            "1,0,0,0,100,100,0,0,1,2.4,1.3,5,80,80,"
-            "0,1",
-            "",
-            "[Events]",
-            "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
-            *dialogue_lines,
-            "",
-        ]
-    )
+    ass = "\n".join([*_ass_header(caption_cfg), *dialogue_lines, ""])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(ass, encoding="utf-8")
+    return str(output_path)
+
+
+def _ass_header(caption_cfg: CaptionRenderConfig) -> list[str]:
+    """Return the ASS [Script Info] + [V4+ Styles] + [Events] header lines."""
+    return [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: 1080",
+        "PlayResY: 1920",
+        "",
+        "[V4+ Styles]",
+        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+        "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+        "Alignment,MarginL,MarginR,MarginV,Encoding",
+        f"Style: Default,Arial,{caption_cfg.font_size},&H00FFFFFF&,&H00FFFFFF&,&H00303030&,&H64000000&,"
+        "1,0,0,0,100,100,0,0,1,2.2,1.2,2,80,80,"
+        f"{caption_cfg.margin_v},1",
+        f"Style: Hook,Arial,{int(caption_cfg.font_size * caption_cfg.hook_scale)},&H00FFFFFF&,&H00FFFFFF&,&H00303030&,&H64000000&,"
+        "1,0,0,0,100,100,0,0,1,2.4,1.3,5,80,80,"
+        "0,1",
+        "",
+        "[Events]",
+        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
+    ]
+
+
+def _generate_ass_subtitles_from_alignment(
+    word_timings: list[dict],
+    output_path: Path,
+    caption_cfg: CaptionRenderConfig,
+) -> str:
+    """Generate an ASS subtitle file using exact word timestamps from the alignment API.
+
+    Parameters
+    ----------
+    word_timings:
+        List of ``{"word": str, "start": float, "end": float}`` dicts.
+    output_path:
+        Destination ``.ass`` file path.
+    caption_cfg:
+        Caption rendering options.
+
+    Returns ``str(output_path)``.
+    """
+    words = [t["word"] for t in word_timings]
+    chunks = _smart_chunk_words(words, target_size=max(2, caption_cfg.words_per_chunk))
+
+    dialogue_lines: list[str] = []
+    word_cursor = 0
+
+    for chunk_idx, chunk_words in enumerate(chunks):
+        chunk_timings = word_timings[word_cursor : word_cursor + len(chunk_words)]
+        word_cursor += len(chunk_words)
+
+        if not chunk_timings:
+            continue
+
+        style = "Hook" if chunk_idx <= 1 else "Default"
+
+        for word_idx, (word, timing) in enumerate(zip(chunk_words, chunk_timings)):
+            w_start = timing["start"]
+            w_end = timing["end"]
+
+            rendered_words: list[str] = []
+            for highlight_idx, token in enumerate(chunk_words):
+                escaped = _ass_escape_text(token)
+                if highlight_idx == word_idx and caption_cfg.style_mode == "active_word":
+                    rendered_words.append(
+                        "{\\c"
+                        + caption_cfg.active_word_highlight_color
+                        + "}"
+                        + escaped
+                        + "{\\c&HFFFFFF&}"
+                    )
+                else:
+                    rendered_words.append(escaped)
+
+            rendered_text = " ".join(rendered_words)
+            dialogue_lines.append(
+                "Dialogue: 0,"
+                f"{_seconds_to_ass_time(w_start)},{_seconds_to_ass_time(w_end)},"
+                f"{style},,0,0,0,,{rendered_text}"
+            )
+
+    ass = "\n".join([*_ass_header(caption_cfg), *dialogue_lines, ""])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(ass, encoding="utf-8")
     return str(output_path)
@@ -773,8 +778,8 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
     )
     audio_path = str(trimmed_audio_path)
 
-    # Derive exact duration from the generated WAV for accurate subtitle sync
-    audio_duration = _get_wav_duration(audio_path)
+    # Derive exact duration from the generated audio for accurate subtitle sync
+    audio_duration = _probe_media_duration_seconds(Path(audio_path))
     if audio_duration <= 0:
         logger.warning(
             "Could not determine audio duration for %r; subtitle timing will use estimate.",
@@ -784,12 +789,31 @@ def render_video(content: EnhancedContent, work_dir: str = "output/_build") -> P
     # ── PART 3/4: capture exact runtime caption input ──────────────────────
     exact_caption_input: str = final_script
     if runtime_cfg.caption.style_mode in {"active_word", "plain"}:
-        subtitles_path = _generate_ass_subtitles(
-            caption_script=exact_caption_input,
-            output_path=root / "subs" / f"{stem}.ass",
-            audio_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(final_script),
-            caption_cfg=runtime_cfg.caption,
-        )
+        # Attempt ElevenLabs forced alignment for exact word timestamps
+        el_api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+        el_voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+        word_timings: list[dict] = []
+        if el_api_key and el_voice_id:
+            from .elevenlabs_client import ElevenLabsClient
+            el_model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip() or "eleven_multilingual_v2"
+            el_client = ElevenLabsClient(api_key=el_api_key, voice_id=el_voice_id, model_id=el_model_id)
+            word_timings = el_client.get_alignment(audio_path, exact_caption_input)
+
+        if word_timings:
+            subtitles_path = _generate_ass_subtitles_from_alignment(
+                word_timings=word_timings,
+                output_path=root / "subs" / f"{stem}.ass",
+                caption_cfg=runtime_cfg.caption,
+            )
+        else:
+            if el_api_key and el_voice_id:
+                logger.info("ElevenLabs alignment unavailable, falling back to estimated caption timing")
+            subtitles_path = _generate_ass_subtitles(
+                caption_script=exact_caption_input,
+                output_path=root / "subs" / f"{stem}.ass",
+                audio_duration=audio_duration if audio_duration > 0 else _estimate_duration_seconds(final_script),
+                caption_cfg=runtime_cfg.caption,
+            )
     else:
         subtitles_path = _generate_subtitles(
             exact_caption_input,
