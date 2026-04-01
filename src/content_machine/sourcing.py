@@ -46,7 +46,7 @@ def fetch_reddit_posts() -> list[RawPost]:
     min_score = int(cfg.get("min_score", 0))
     min_comments = int(cfg.get("min_comments", 0))
     lookback_hours = int(cfg.get("lookback_hours", 72))
-    max_posts_per_subreddit = int(cfg.get("max_posts_per_subreddit", 25))
+    max_posts_per_subreddit = int(cfg.get("max_posts_per_subreddit", 1))
     subreddits = cfg.get("subreddits", [])
 
     normalized: list[RawPost] = []
