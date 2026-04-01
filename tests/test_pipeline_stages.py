@@ -511,13 +511,14 @@ class TestPipelineStages(unittest.TestCase):
         self.assertEqual(["collect", "filter", "rank", "enhance", "produce", "export"], called)
 
     # ------------------------------------------------------------------
-    # Piper TTS tests
+    # TTS tests
     # ------------------------------------------------------------------
 
     def test_generate_tts_no_piper_exe_uses_stub(self):
-        """When PIPER_EXE is not set, _generate_tts falls back to the silent stub."""
+        """When ElevenLabs keys are not set, _generate_tts falls back to the silent stub."""
         from content_machine.production import _generate_tts
-        env_backup = os.environ.pop("PIPER_EXE", None)
+        api_key_backup = os.environ.pop("ELEVENLABS_API_KEY", None)
+        voice_id_backup = os.environ.pop("ELEVENLABS_VOICE_ID", None)
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 out = Path(tmpdir) / "audio" / "test.wav"
@@ -526,27 +527,42 @@ class TestPipelineStages(unittest.TestCase):
                 self.assertTrue(out.exists())
                 self.assertGreater(out.stat().st_size, 0)
         finally:
-            if env_backup is not None:
-                os.environ["PIPER_EXE"] = env_backup
+            if api_key_backup is not None:
+                os.environ["ELEVENLABS_API_KEY"] = api_key_backup
+            if voice_id_backup is not None:
+                os.environ["ELEVENLABS_VOICE_ID"] = voice_id_backup
 
     def test_generate_tts_missing_exe_warns_and_uses_stub(self):
-        """When PIPER_EXE points to a non-existent file, log warning and use stub."""
+        """When ELEVENLABS_API_KEY is set but ElevenLabs call fails, log warning and use stub."""
         from content_machine.production import _generate_tts
         import logging
-        env_backup = os.environ.get("PIPER_EXE")
-        os.environ["PIPER_EXE"] = "/nonexistent/path/to/piper"
+        from content_machine import elevenlabs_client as el_mod
+        api_key_backup = os.environ.get("ELEVENLABS_API_KEY")
+        voice_id_backup = os.environ.get("ELEVENLABS_VOICE_ID")
+        os.environ["ELEVENLABS_API_KEY"] = "test-key"
+        os.environ["ELEVENLABS_VOICE_ID"] = "test-voice"
+        original_generate_speech = el_mod.ElevenLabsClient.generate_speech
+
+        def _fail_generate_speech(self, text, output_path):
+            raise RuntimeError("simulated ElevenLabs failure")
+
+        el_mod.ElevenLabsClient.generate_speech = _fail_generate_speech
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 out = Path(tmpdir) / "audio" / "test.wav"
                 with self.assertLogs("content_machine.production", level=logging.WARNING):
                     result = _generate_tts("Hello world", out)
-                self.assertEqual(result, str(out))
-                self.assertTrue(out.exists())
+                self.assertTrue(Path(result).exists())
         finally:
-            if env_backup is None:
-                os.environ.pop("PIPER_EXE", None)
+            el_mod.ElevenLabsClient.generate_speech = original_generate_speech
+            if api_key_backup is None:
+                os.environ.pop("ELEVENLABS_API_KEY", None)
             else:
-                os.environ["PIPER_EXE"] = env_backup
+                os.environ["ELEVENLABS_API_KEY"] = api_key_backup
+            if voice_id_backup is None:
+                os.environ.pop("ELEVENLABS_VOICE_ID", None)
+            else:
+                os.environ["ELEVENLABS_VOICE_ID"] = voice_id_backup
 
     # ------------------------------------------------------------------
     # OpenAI ranking response parsing tests
@@ -800,24 +816,40 @@ class TestPipelineStages(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_generate_tts_piper_exe_points_to_folder_warns_clearly(self):
-        """When PIPER_EXE is a directory (not an exe), the warning says so clearly."""
+        """When ELEVENLABS_API_KEY/VOICE_ID are set but ElevenLabs raises, warning mentions the error."""
         from content_machine.production import _generate_tts
-        env_backup = os.environ.get("PIPER_EXE")
-        # Use a path that exists (the tmpdir itself) but is a directory, not a file
-        with tempfile.TemporaryDirectory() as tmpdir:
-            os.environ["PIPER_EXE"] = tmpdir  # folder, not file
-            out = Path(tmpdir) / "audio" / "out.wav"
-            with self.assertLogs("content_machine.production", level="WARNING") as cm:
-                result = _generate_tts("hello", out)
-            # Should fall back to stub successfully
-            self.assertTrue(Path(result).exists())
-            # Warning must tell user to point to the exe, not the folder
-            joined = "\n".join(cm.output)
-            self.assertIn("executable", joined.lower())
-        if env_backup is None:
-            os.environ.pop("PIPER_EXE", None)
-        else:
-            os.environ["PIPER_EXE"] = env_backup
+        from content_machine import elevenlabs_client as el_mod
+        api_key_backup = os.environ.get("ELEVENLABS_API_KEY")
+        voice_id_backup = os.environ.get("ELEVENLABS_VOICE_ID")
+        os.environ["ELEVENLABS_API_KEY"] = "test-key"
+        os.environ["ELEVENLABS_VOICE_ID"] = "test-voice"
+
+        original_generate_speech = el_mod.ElevenLabsClient.generate_speech
+
+        def _fail_generate_speech(self, text, output_path):
+            raise RuntimeError("connection refused")
+
+        el_mod.ElevenLabsClient.generate_speech = _fail_generate_speech
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out = Path(tmpdir) / "audio" / "out.wav"
+                with self.assertLogs("content_machine.production", level="WARNING") as cm:
+                    result = _generate_tts("hello", out)
+                # Should fall back to stub successfully
+                self.assertTrue(Path(result).exists())
+                # Warning must mention the failure
+                joined = "\n".join(cm.output)
+                self.assertIn("ElevenLabs", joined)
+        finally:
+            el_mod.ElevenLabsClient.generate_speech = original_generate_speech
+            if api_key_backup is None:
+                os.environ.pop("ELEVENLABS_API_KEY", None)
+            else:
+                os.environ["ELEVENLABS_API_KEY"] = api_key_backup
+            if voice_id_backup is None:
+                os.environ.pop("ELEVENLABS_VOICE_ID", None)
+            else:
+                os.environ["ELEVENLABS_VOICE_ID"] = voice_id_backup
 
     # ------------------------------------------------------------------
     # pipeline.run_pipeline – error propagation test
