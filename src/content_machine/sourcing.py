@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 _REDDIT_URL = "https://www.reddit.com/r/{subreddit}/top.json?t=day&limit=50"
 _TWITTERAPI_IO_URL = "https://api.twitterapi.io/twitter/user/last_tweets"
 
-
 def _parse_datetime(value: str) -> datetime:
     if not value:
         return datetime.now(tz=timezone.utc)
@@ -29,16 +28,13 @@ def _parse_datetime(value: str) -> datetime:
 
     return datetime.fromisoformat(value)
 
-
 def _is_within_lookback(created_at: datetime, lookback_hours: int) -> bool:
     threshold = datetime.now(tz=timezone.utc) - timedelta(hours=lookback_hours)
     return created_at >= threshold
 
-
 def _request_json(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
     request = Request(url=url, headers=headers or {})
     return request_json_with_retries(request, operation=f"GET {url}", timeout=20, max_attempts=3)
-
 
 def fetch_reddit_posts() -> list[RawPost]:
     """Fetch and normalize Reddit posts according to config thresholds."""
@@ -50,6 +46,7 @@ def fetch_reddit_posts() -> list[RawPost]:
     min_score = int(cfg.get("min_score", 0))
     min_comments = int(cfg.get("min_comments", 0))
     lookback_hours = int(cfg.get("lookback_hours", 72))
+    max_posts_per_subreddit = int(cfg.get("max_posts_per_subreddit", 25))
     subreddits = cfg.get("subreddits", [])
 
     normalized: list[RawPost] = []
@@ -64,7 +61,11 @@ def fetch_reddit_posts() -> list[RawPost]:
             continue
 
         children = payload.get("data", {}).get("children", [])
+        subreddit_posts: list[RawPost] = []
         for item in children:
+            if len(subreddit_posts) >= max_posts_per_subreddit:
+                break
+
             data = item.get("data", {})
 
             score = int(data.get("score", 0))
@@ -88,7 +89,7 @@ def fetch_reddit_posts() -> list[RawPost]:
                 or data.get("post_hint") in {"image", "hosted:video", "rich:video"}
             )
 
-            normalized.append(
+            subreddit_posts.append(
                 RawPost(
                     source="reddit",
                     source_id=str(data.get("id", "")),
@@ -106,8 +107,9 @@ def fetch_reddit_posts() -> list[RawPost]:
                 )
             )
 
-    return normalized
+        normalized.extend(subreddit_posts)
 
+    return normalized
 
 def fetch_x_posts() -> list[RawPost]:
     """Fetch and normalize X posts via twitterapi.io according to config thresholds."""
@@ -188,7 +190,6 @@ def fetch_x_posts() -> list[RawPost]:
             )
 
     return normalized
-
 
 def collect_raw_posts() -> list[RawPost]:
     """Collect all raw posts from enabled sources."""
