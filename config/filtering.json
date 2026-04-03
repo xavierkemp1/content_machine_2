@@ -2,7 +2,8 @@
   "blacklist_phrases": ["graphic violence", "self-harm"],
   "length_buckets": {
     "short_max_words": 80,
-    "medium_max_words": 200
+    "medium_max_words": 200,
+    "max_duration_seconds": 180
   },
   "dedupe": {
     "enabled": true,

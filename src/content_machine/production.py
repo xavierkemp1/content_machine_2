@@ -28,6 +28,9 @@ class CaptionRenderConfig:
     words_per_chunk: int = 4
     min_chunk_seconds: float = 0.9
     hook_scale: float = 1.12
+    hook_num_chunks: int = 1
+    hook_margin_v: int = 0
+    bridge_word_gaps: bool = True
 
 
 @dataclass(frozen=True)
@@ -123,6 +126,9 @@ def _load_runtime_config() -> ProductionRuntimeConfig:
             active_word_highlight_color=highlight_color,
             font_size=62 + font_size_jitter,
             margin_v=210 + margin_v_jitter,
+            hook_num_chunks=max(1, int(os.getenv("CAPTION_HOOK_NUM_CHUNKS", "1") or "1")),
+            hook_margin_v=int(os.getenv("CAPTION_HOOK_MARGIN_V", "0") or "0"),
+            bridge_word_gaps=os.getenv("CAPTION_BRIDGE_WORD_GAPS", "1").strip().lower() in {"1", "true", "yes"},
         ),
     )
 
@@ -350,7 +356,7 @@ def _build_ass_dialogue_lines(
                 else:
                     rendered_words.append(escaped)
             rendered_text = " ".join(rendered_words)
-            style = "Hook" if idx <= 1 else "Default"
+            style = "Hook" if idx < caption_cfg.hook_num_chunks else "Default"
             lines.append(
                 "Dialogue: 0,"
                 f"{_seconds_to_ass_time(word_elapsed)},{_seconds_to_ass_time(word_end)},"
@@ -391,7 +397,7 @@ def _ass_header(caption_cfg: CaptionRenderConfig) -> list[str]:
         f"{caption_cfg.margin_v},1",
         f"Style: Hook,Arial,{int(caption_cfg.font_size * caption_cfg.hook_scale)},&H00FFFFFF&,&H00FFFFFF&,&H00303030&,&H64000000&,"
         "1,0,0,0,100,100,0,0,1,2.4,1.3,5,80,80,"
-        "0,1",
+        f"{caption_cfg.hook_margin_v},1",
         "",
         "[Events]",
         "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
@@ -429,11 +435,17 @@ def _generate_ass_subtitles_from_alignment(
         if not chunk_timings:
             continue
 
-        style = "Hook" if chunk_idx <= 1 else "Default"
+        style = "Hook" if chunk_idx < caption_cfg.hook_num_chunks else "Default"
 
         for word_idx, (word, timing) in enumerate(zip(chunk_words, chunk_timings)):
             w_start = timing["start"]
             w_end = timing["end"]
+
+            # Bridge the gap to the next word so there are no blank frames between words.
+            if caption_cfg.bridge_word_gaps and word_idx < len(chunk_timings) - 1:
+                next_start = chunk_timings[word_idx + 1]["start"]
+                if next_start > w_end:
+                    w_end = next_start
 
             rendered_words: list[str] = []
             for highlight_idx, token in enumerate(chunk_words):

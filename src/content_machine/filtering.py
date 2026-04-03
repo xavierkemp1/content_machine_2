@@ -77,6 +77,8 @@ def apply_rules(posts: list[RawPost]) -> list[RawPost]:
     medium_max_words = int(length_cfg.get("medium_max_words", 200))
     max_words = int(length_cfg.get("max_words", 450))
     min_words = int(length_cfg.get("min_words", 10))
+    max_duration_raw = length_cfg.get("max_duration_seconds")
+    max_duration_seconds: float | None = float(max_duration_raw) if max_duration_raw is not None else None
 
     dedupe_cfg = cfg.get("dedupe", {})
     dedupe_enabled = bool(dedupe_cfg.get("enabled", True))
@@ -93,6 +95,11 @@ def apply_rules(posts: list[RawPost]) -> list[RawPost]:
         word_count = _word_count(text)
         if word_count < min_words or word_count > max_words:
             continue
+
+        if max_duration_seconds is not None:
+            estimated_duration = max(6.0, (word_count / 145.0) * 60.0)
+            if estimated_duration > max_duration_seconds:
+                continue
 
         if any(phrase in text_lower for phrase in blacklist):
             continue
